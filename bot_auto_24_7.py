@@ -1,196 +1,184 @@
 """
-BOT TU DONG 100% - SOL vs MEXC - chay 24/7
-Khong can them token thu cong - tu quet toan bo token SOL tren MEXC
+BOT FULL - SOL MEXC ARBITRAGE ALERT
+Nhiem vu:
+1. Lay danh sach token mang SOL niem yet tren MEXC
+2. Xac dinh token thuoc mang Solana (qua API capital/config/getall)
+3. So sanh gia MEXC vs DEX Solana (Jupiter + DexScreener)
+4. Gui canh bao Telegram neu chenh lech > 3%
 """
 
 import requests
 import time
-import json
 import os
 from datetime import datetime
 
-# ============== DIEN THONG TIN ==============
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "Dien token vao day neu chay local")
-CHAT_ID = os.getenv("CHAT_ID", "Dien chat_id vao day")
-# ============================================
+# --- CAU HINH ---
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8942050944:AAF6tftI7lTYErDCSnLhQSG1BXkUeU7-m3E")
+CHAT_ID = os.getenv("CHAT_ID", "469374705")
+CHECK_INTERVAL = 120  # 2 phut check 1 lan
+PRICE_DIFF_THRESHOLD = 3.0  # chenh 3% thi bao
 
-last_alert = {}  # cooldown 1 phut
-known_mexc_symbols = set()
+notified_tokens = set()
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}
+def send_telegram(msg):
     try:
-        requests.post(url, json=data, timeout=10)
-        print(f"-> Da gui Telegram")
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}
+        r = requests.post(url, data=data, timeout=10)
+        print(f"Telegram sent: {r.status_code}")
+        return r.status_code == 200
     except Exception as e:
-        print(f"Loi Telegram: {e}")
+        print(f"Loi gui Telegram: {e}")
+        return False
 
-def get_all_sol_tokens_from_jupiter():
-    """Lay toan bo token SOL verified tu Jupiter - co ca mint va symbol"""
+def get_mexc_sol_tokens():
+    """Lay danh sach token co mang SOL tren MEXC"""
     try:
-        # Jupiter token list verified
-        url = "https://price.jup.ag/v6/tokens"
-        # Hoac dung cache token list chuan hon
-        url2 = "https://tokens.jup.ag/tokens?tags=verified"
-        # Thu url2 truoc
-        res = requests.get(url2, timeout=15).json()
-        # Tao dict symbol -> mint (lay mint dau tien neu trung symbol)
-        mapping = {}
-        for t in res:
-            sym = t.get('symbol','').upper()
-            if sym and sym not in mapping:
-                mapping[sym] = t.get('address')
-        print(f"Da lay {len(mapping)} token SOL tu Jupiter")
-        return mapping
+        url = "https://api.mexc.com/api/v3/capital/config/getall"
+        r = requests.get(url, timeout=15)
+        data = r.json()
+        sol_tokens = []
+        for coin in data:
+            coin_name = coin.get("coin", "")
+            networks = coin.get("networkList", [])
+            for net in networks:
+                if net.get("network", "").upper() == "SOL" and net.get("depositEnable", False):
+                    contract = net.get("contract", "")  # mint address Solana
+                    sol_tokens.append({
+                        "symbol": coin_name,
+                        "contract": contract,
+                        "network": "SOL",
+                        "withdrawEnable": net.get("withdrawEnable", False)
+                    })
+        print(f"[MEXC] Tim thay {len(sol_tokens)} token mang SOL")
+        return sol_tokens
     except Exception as e:
-        print(f"Loi lay Jupiter token list: {e}")
-        # Fallback list nho
-        return {"WIF":"EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm", "BONK":"DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}
+        print(f"Loi lay MEXC SOL tokens: {e}")
+        return []
 
-def get_mexc_all_usdt_pairs():
-    """Lay tat ca cap USDT tren MEXC"""
+def get_mexc_price(symbol):
+    """Lay gia tren MEXC: SYMBOL/USDT"""
     try:
-        url = "https://api.mexc.com/api/v3/ticker/price"
-        res = requests.get(url, timeout=10).json()
-        # Chi lay cap USDT
-        usdt_pairs = {}
-        for item in res:
-            if item['symbol'].endswith('USDT'):
-                base = item['symbol'].replace('USDT','')
-                usdt_pairs[base] = float(item['price'])
-        return usdt_pairs
+        # Thu USDT pair
+        for quote in ["USDT", "USDC"]:
+            pair = f"{symbol}{quote}"
+            url = f"https://api.mexc.com/api/v3/ticker/price?symbol={pair}"
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                price = float(data.get("price", 0))
+                if price > 0:
+                    return price, pair
+        return None, None
     except Exception as e:
-        print(f"Loi MEXC: {e}")
-        return {}
+        print(f"Loi gia MEXC {symbol}: {e}")
+        return None, None
 
-def get_jupiter_batch_prices(mints):
-    """Lay gia hang loat tu Jupiter - toi da 100 mint 1 lan"""
+def get_sol_dex_price(contract_or_symbol):
+    """Lay gia tren DEX Solana qua DexScreener + Jupiter"""
+    price = None
+    source = ""
+    # Thu DexScreener neu co contract (mint address)
+    if contract_or_symbol and len(contract_or_symbol) > 30:  # mint address dai
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{contract_or_symbol}"
+            r = requests.get(url, timeout=10)
+            data = r.json()
+            pairs = data.get("pairs", [])
+            if pairs:
+                # Lay pair co thanh khoan cao nhat
+                best = max(pairs, key=lambda x: float(x.get("liquidity", {}).get("usd", 0) or 0))
+                price = float(best.get("priceUsd", 0))
+                source = f"DexScreener/{best.get('dexId')}"
+                if price and price > 0:
+                    return price, source
+        except Exception as e:
+            print(f"Loi DexScreener {contract_or_symbol}: {e}")
+
+    # Fallback: Jupiter Price API cho token symbol (neu la token lon)
     try:
-        # Chia nho neu qua nhieu
-        prices = {}
-        chunk_size = 100
-        mint_list = list(mints)
-        for i in range(0, len(mint_list), chunk_size):
-            chunk = mint_list[i:i+chunk_size]
-            ids = ",".join(chunk)
-            url = f"https://api.jup.ag/price/v2?ids={ids}"
-            res = requests.get(url, timeout=10).json()
-            data = res.get('data', {})
-            for mint, info in data.items():
-                if info and 'price' in info:
-                    prices[mint] = float(info['price'])
-        return prices
-    except Exception as e:
-        print(f"Loi Jupiter price: {e}")
-        return {}
+        # Jupiter can tim bang symbol, nhung can mint - o day dung co che search
+        # Voi token khong co mint, bo qua
+        pass
+    except:
+        pass
 
-def check_arbitrage_auto():
-    print(f"\n=== Quet tu dong luc {datetime.now().strftime('%H:%M:%S')} ===")
-    
-    # 1. Lay danh sach token SOL va gia MEXC
-    sol_mapping = get_all_sol_tokens_from_jupiter()  # symbol -> mint
-    mexc_prices = get_mexc_all_usdt_pairs()  # symbol -> price
-    
-    # 2. Tim giao nhau: token vua co tren SOL vua co tren MEXC
-    common_symbols = set(sol_mapping.keys()) & set(mexc_prices.keys())
-    print(f"Tim thay {len(common_symbols)} token chung giua SOL va MEXC")
-    
-    if not common_symbols:
-        return
-    
-    # 3. Lay gia DEX cho cac token chung
-    mints_to_check = [sol_mapping[s] for s in common_symbols]
-    jup_prices_by_mint = get_jupiter_batch_prices(mints_to_check)
-    # Dao nguoc: mint -> symbol
-    mint_to_symbol = {v:k for k,v in sol_mapping.items()}
-    
-    # 4. So sanh
-    for mint, dex_price in jup_prices_by_mint.items():
-        symbol = mint_to_symbol.get(mint)
-        if not symbol:
-            continue
-        cex_price = mexc_prices.get(symbol)
-        if not cex_price or dex_price == 0:
-            continue
-        
-        diff = (dex_price - cex_price) / cex_price * 100
-        abs_diff = abs(diff)
-        
-        # Chi in ra neu chenh > 2% de de debug
-        if abs_diff > 2:
-            print(f"{symbol}: DEX {dex_price:.6f} | MEXC {cex_price:.6f} | {diff:+.2f}%")
-        
-        if abs_diff > 3:
-            now = time.time()
-            if symbol in last_alert and (now - last_alert[symbol] < 60):
-                continue
-            last_alert[symbol] = now
-            
-            link_mexc = f"https://www.mexc.com/exchange/{symbol}_USDT"
-            text = f"""⚡️ CHENH LECH {abs_diff:.2f}% - {symbol}
+    return price, source
 
-Token: *{symbol}*
-Contract: `{mint}`
+def main_loop():
+    print("="*60)
+    print("BOT FULL SOL-MEXC ARBITRAGE BAT DAU")
+    print(f"Thoi gian: {datetime.now()}")
+    print(f"Nguong chenh lech: {PRICE_DIFF_THRESHOLD}%")
+    print("="*60)
 
-Gia MEXC: ${cex_price:.6f}
-Gia DEX: ${dex_price:.6f}
-Chenh: {diff:+.2f}%
+    send_telegram(f"🚀 <b>BOT SOL-MEXC FULL DA BAT DAU</b>\n\n"
+                  f"Nhiem vu:\n"
+                  f"1. Quet token mang SOL tren MEXC\n"
+                  f"2. So sanh gia MEXC vs DEX Solana\n"
+                  f"3. Bao khi chenh > {PRICE_DIFF_THRESHOLD}%\n\n"
+                  f"Check moi {CHECK_INTERVAL}s")
 
-Huong: {"MUA MEXC BAN DEX" if diff>0 else "MUA DEX BAN MEXC"}
-
-Link MEXC: {link_mexc}
-Dex: https://jup.ag/swap/USDT-{mint}
-Solscan: https://solscan.io/token/{mint}
-"""
-            send_telegram(text)
-
-def check_new_listing_auto():
-    global known_mexc_symbols
-    try:
-        url = "https://api.mexc.com/api/v3/exchangeInfo"
-        res = requests.get(url, timeout=10).json()
-        current = set([s['symbol'] for s in res['symbols'] if s['status']=='ENABLED' and s['symbol'].endswith('USDT')])
-        
-        if not known_mexc_symbols:
-            known_mexc_symbols = current
-            print(f"Luu {len(current)} cap USDT lam moc")
-            return
-        
-        new_list = current - known_mexc_symbols
-        if new_list:
-            sol_map = get_all_sol_tokens_from_jupiter()
-            for full_sym in new_list:
-                base = full_sym.replace('USDT','')
-                if base in sol_map:
-                    mint = sol_map[base]
-                    text = f"""🆕 *{base} DA LIET KE TREN MEXC* - Mang SOL
-
-Token: *{base}*
-Contract: `{mint}`
-
-Link giao dich: https://www.mexc.com/exchange/{base}_USDT
-Solscan: https://solscan.io/token/{mint}
-
-Co hoi chenh lech moi!
-"""
-                    send_telegram(text)
-            known_mexc_symbols = current
-    except Exception as e:
-        print(f"Loi new listing: {e}")
-
-if __name__ == "__main__":
-    print("BOT TU DONG BAT DAU")
-    send_telegram("Bot SOL AUTO da bat dau - Tu quet toan bo token SOL tren MEXC")
-    
-    count = 0
     while True:
         try:
-            check_arbitrage_auto()
-            count += 1
-            if count % 5 == 0:
-                check_new_listing_auto()
-            time.sleep(20)
+            sol_tokens = get_mexc_sol_tokens()
+            # Chi check 30 token dau moi lan de tranh bi rate limit
+            # Uu tien token moi hoac co thanh khoan
+            for token in sol_tokens[:40]:
+                symbol = token["symbol"]
+                contract = token["contract"]
+
+                if not contract:
+                    continue  # bo qua token khong co mint
+
+                mexc_price, mexc_pair = get_mexc_price(symbol)
+                if not mexc_price:
+                    continue
+
+                dex_price, dex_source = get_sol_dex_price(contract)
+                if not dex_price:
+                    continue
+
+                diff_percent = abs(mexc_price - dex_price) / dex_price * 100
+
+                print(f"{symbol}: MEXC={mexc_price:.6f} | DEX={dex_price:.6f} ({dex_source}) | Diff={diff_percent:.2f}%")
+
+                if diff_percent >= PRICE_DIFF_THRESHOLD:
+                    key = f"{symbol}_{int(mexc_price*1000)}"
+                    if key in notified_tokens:
+                        continue  # da bao roi
+                    notified_tokens.add(key)
+
+                    # Tinh loi nhuan
+                    if mexc_price < dex_price:
+                        action = "MUA MEXC -> BAN DEX"
+                        profit = f"+{diff_percent:.2f}%"
+                    else:
+                        action = "MUA DEX -> BAN MEXC"
+                        profit = f"+{diff_percent:.2f}%"
+
+                    msg = (
+                        f"💰 <b>CO HOI ARBITRAGE SOL!</b>\n\n"
+                        f"Token: <b>{symbol}</b>\n"
+                        f"Mang: SOL (Solana)\n"
+                        f"Contract: <code>{contract[:12]}...{contract[-6:]}</code>\n\n"
+                        f"📊 Gia MEXC ({mexc_pair}): <b>${mexc_price:.6f}</b>\n"
+                        f"📊 Gia DEX ({dex_source}): <b>${dex_price:.6f}</b>\n"
+                        f"📈 Chênh lệch: <b>{profit}</b>\n"
+                        f"🎯 Huong: {action}\n\n"
+                        f"🔗 MEXC: https://www.mexc.com/exchange/{mexc_pair}\n"
+                        f"🔗 DexScreener: https://dexscreener.com/solana/{contract}\n\n"
+                        f"⏰ {datetime.now().strftime('%H:%M:%S %d/%m')}"
+                    )
+                    send_telegram(msg)
+                    time.sleep(2)
+
+            print(f"--- Xong 1 vong, nghi {CHECK_INTERVAL}s ---")
+            time.sleep(CHECK_INTERVAL)
+
         except Exception as e:
-            print(f"Loi loop: {e}")
-            time.sleep(10)
+            print(f"Loi main loop: {e}")
+            time.sleep(30)
+
+if __name__ == "__main__":
+    main_loop()
