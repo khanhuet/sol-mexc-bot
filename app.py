@@ -6,7 +6,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Dual Bot: SOL + Robinhood Chain - Dang chay 24/7 - OK"
+    return "9 Bots: SOL + RH + BNB + Base + ETH + Arc + Polygon + NEAR + Arbitrum - 24/7 OK"
 
 @app.route('/health')
 def health():
@@ -23,11 +23,19 @@ def run_bot(file_name, name):
         time.sleep(10)
 
 if __name__ == '__main__':
-    # Chay 2 bot song song
-    t1 = threading.Thread(target=run_bot, args=("bot_auto_24_7.py", "SOL"), daemon=True)
-    t2 = threading.Thread(target=run_bot, args=("bot_robinhood_chain.py", "ROBINHOOD"), daemon=True)
-    t1.start()
-    t2.start()
+    bots = [
+        ("bot_auto_24_7.py", "SOL"),
+        ("bot_robinhood_chain.py", "ROBINHOOD"),
+        ("bot_bnb_chain.py", "BNB"),
+        ("bot_base_chain.py", "BASE"),
+        ("bot_eth_chain.py", "ETH"),
+        ("bot_arc_chain.py", "ARC"),
+        ("bot_polygon_chain.py", "POLYGON"),
+        ("bot_near_chain.py", "NEAR"),
+        ("bot_arbitrum_chain.py", "ARBITRUM"),
+    ]
+    for f, n in bots:
+        threading.Thread(target=run_bot, args=(f, n), daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
-    print(f"Web server chay tren port {port} - 2 bot SOL + RH")
+    print(f"Web server chay tren port {port} - 9 bot")
     app.run(host='0.0.0.0', port=port)
