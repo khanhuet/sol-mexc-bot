@@ -1,35 +1,33 @@
 
-import threading
-import os
-import subprocess
-import time
+import threading, os, time, subprocess
 from flask import Flask
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot SOL MEXC dang chay 24/7 FREE - OK! Bot dang tim token SOL moi list tren MEXC..."
+    return "Dual Bot: SOL + Robinhood Chain - Dang chay 24/7 - OK"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
-def run_bot():
-    print("Dang khoi dong bot SOL-MEXC...")
-    print("Bot se thong bao khi co token mang SOL moi list tren MEXC")
+def run_bot(file_name, name):
+    print(f"[{name}] Dang khoi dong {file_name}...")
     while True:
         try:
-            # Chay file bot chinh
-            result = subprocess.run(["python", "bot_auto_24_7.py"], capture_output=False)
-            print(f"Bot ket thuc voi code {result.returncode}, se khoi dong lai sau 10s...")
+            result = subprocess.run(["python", file_name])
+            print(f"[{name}] Ket thuc code {result.returncode}, khoi dong lai sau 10s...")
         except Exception as e:
-            print(f"Loi chay bot: {e}")
+            print(f"[{name}] Loi: {e}")
         time.sleep(10)
 
 if __name__ == '__main__':
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
+    # Chay 2 bot song song
+    t1 = threading.Thread(target=run_bot, args=("bot_auto_24_7.py", "SOL"), daemon=True)
+    t2 = threading.Thread(target=run_bot, args=("bot_robinhood_chain.py", "ROBINHOOD"), daemon=True)
+    t1.start()
+    t2.start()
     port = int(os.environ.get("PORT", 10000))
-    print(f"Web server dang chay tren port {port}")
+    print(f"Web server chay tren port {port} - 2 bot SOL + RH")
     app.run(host='0.0.0.0', port=port)
