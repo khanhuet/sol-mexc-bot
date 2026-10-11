@@ -180,8 +180,10 @@ class MexcData:
         self.retry_after=0
     def _fetch_pairs(self):
         r=http_get(f"{MEXC_BASE}/api/v3/exchangeInfo",limiter=MEXC_LIMITER,timeout=20)
-        if not r or r.status_code!=200:
-            raise RuntimeError("exchangeInfo fail")
+        if not r:
+            raise RuntimeError("exchangeInfo no response")
+        if r.status_code!=200:
+            raise RuntimeError(f"exchangeInfo fail {r.status_code} {r.text[:200]}")
         data=r.json()
         out={}
         for s in data.get("symbols",[]):
@@ -190,8 +192,10 @@ class MexcData:
         return out
     def _fetch_tokens(self,pairs):
         r=mexc_signed_get("/api/v3/capital/config/getall")
-        if not r or r.status_code!=200:
-            raise RuntimeError("capital/config fail")
+        if not r:
+            raise RuntimeError(f"capital/config no response")
+        if r.status_code!=200:
+            raise RuntimeError(f"capital/config fail {r.status_code} {r.text[:200]}")
         coins=r.json()
         result={k:{} for k in CHAINS}
         for coin in coins:
@@ -224,9 +228,13 @@ class MexcData:
             if self.tokens and now-self.ts < STATIC_TTL:
                 return
             if now < self.retry_after:
+                # log every time we skip due to retry_after to debug
+                log.warning("MEXC retry_after chua het, bo qua %.0fs", self.retry_after-now)
                 return
             try:
+                log.info("Dang lay exchangeInfo MEXC...")
                 pairs=self._fetch_pairs()
+                log.info("Lay duoc %d pairs, dang lay capital/config...", len(pairs))
                 tokens=self._fetch_tokens(pairs)
                 self.pairs,self.tokens,self.ts=pairs,tokens,now
             except Exception as e:
