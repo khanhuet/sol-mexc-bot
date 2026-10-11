@@ -47,15 +47,15 @@ EVM_USDC={56:"0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",8453:"0x833589fCD6eDb6
 EVM_USDT={56:"0x55d398326f99059fF775485246999027B3197955",8453:"0x50c5725949A6F0c72E6F4a641F24049A917DB138",1:"0xdAC17F958D2ee523a2206206994597C13D831ec7",137:"0xc2132D05D31c914a87C6611C10748AEb04B58e8F",42161:"0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"}
 
 CHAINS={
-    "SOL":{"emoji":"🟣","dex_chain":"solana","evm":False,"gas_usd":0.02,"explorer":"https://solscan.io/token/","chain_id":None,"aliases":{"SOL","SOLANA","SOLANASOL"}},
-    "BNB":{"emoji":"🟡","dex_chain":"bsc","evm":True,"gas_usd":0.15,"explorer":"https://bscscan.com/token/","chain_id":56,"aliases":{"BSC","BEP20","BSCBEP20","BEP20BSC","BNBSMARTCHAIN"}},
-    "BASE":{"emoji":"🔵","dex_chain":"base","evm":True,"gas_usd":0.05,"explorer":"https://basescan.org/token/","chain_id":8453,"aliases":{"BASE","BASECHAIN"}},
-    "ETH":{"emoji":"⚫","dex_chain":"ethereum","evm":True,"gas_usd":2.5,"explorer":"https://etherscan.io/token/","chain_id":1,"aliases":{"ERC20","ETH","ETHEREUM"}},
-    "POLYGON":{"emoji":"💜","dex_chain":"polygon","evm":True,"gas_usd":0.02,"explorer":"https://polygonscan.com/token/","chain_id":137,"aliases":{"MATIC","POLYGON"}},
-    "ARBITRUM":{"emoji":"🔷","dex_chain":"arbitrum","evm":True,"gas_usd":0.15,"explorer":"https://arbiscan.io/token/","chain_id":42161,"aliases":{"ARB","ARBITRUM","ARBITRUMONE"}},
-    "ROBINHOOD":{"emoji":"🔶","dex_chain":"robinhood","evm":True,"gas_usd":0.01,"explorer":"https://robinhoodchain.blockscout.com/token/","chain_id":None,"aliases":{"ROBINHOOD","ROBINHOODCHAIN"}},
-    "ARC":{"emoji":"🟪","dex_chain":"arc","evm":True,"gas_usd":0.02,"explorer":"https://explorer.arc.io/token/","chain_id":None,"aliases":{"ARC","ARCCHAIN"}},
-    "NEAR":{"emoji":"🟢","dex_chain":"near","evm":False,"near":True,"gas_usd":0.01,"explorer":"https://nearblocks.io/token/","chain_id":None,"aliases":{"NEAR","NEARPROTOCOL"}},
+    "SOL":{"emoji":"🟣","dex_chain":"solana","evm":False,"gas_usd":0.02,"explorer":"https://solscan.io/token/","chain_id":None,"aliases":{"SOL","SOLANA","SOLANASOL","SOLSOLANA","SOLMAINNET"}},
+    "BNB":{"emoji":"🟡","dex_chain":"bsc","evm":True,"gas_usd":0.15,"explorer":"https://bscscan.com/token/","chain_id":56,"aliases":{"BSC","BEP20","BSCBEP20","BEP20BSC","BNBSMARTCHAIN","BNBSMARTCHAINBEP20","BNBBEP20","BEP20BNB","BNB","BNBSMAARTCHAINBEP20","BNBSMAARTCHAIN","BSCBNB","BNBSMAART"}},
+    "BASE":{"emoji":"🔵","dex_chain":"base","evm":True,"gas_usd":0.05,"explorer":"https://basescan.org/token/","chain_id":8453,"aliases":{"BASE","BASECHAIN","BASEBASE","BASEMAINNET","BASEETH"}},
+    "ETH":{"emoji":"⚫","dex_chain":"ethereum","evm":True,"gas_usd":2.5,"explorer":"https://etherscan.io/token/","chain_id":1,"aliases":{"ERC20","ETH","ETHEREUM","ETHEREUMERC20","ETHERC20","ERC20ETH","ETHEREUMETH","ETHTOKEN","ETHMAINNET","ERC20ETHEREUM"}},
+    "POLYGON":{"emoji":"💜","dex_chain":"polygon","evm":True,"gas_usd":0.02,"explorer":"https://polygonscan.com/token/","chain_id":137,"aliases":{"MATIC","POLYGON","POLYGONMATIC","POLYGONPOLYGON","MATICPOLYGON","POLYGONPOS","POSPOLYGON","MATICMAINNET","POLYGONMAINNET"}},
+    "ARBITRUM":{"emoji":"🔷","dex_chain":"arbitrum","evm":True,"gas_usd":0.15,"explorer":"https://arbiscan.io/token/","chain_id":42161,"aliases":{"ARB","ARBITRUM","ARBITRUMONE","ARBITRUMONEARB","ARBONE","ARBITRUMONEETH","ARBITRUMNOVA","ARBNOVA","ARBITRUMMAINNET"}},
+    "ROBINHOOD":{"emoji":"🔶","dex_chain":"robinhood","evm":True,"gas_usd":0.01,"explorer":"https://robinhoodchain.blockscout.com/token/","chain_id":None,"aliases":{"ROBINHOOD","ROBINHOODCHAIN","HOODCHAIN","RHCHAIN","ROBINHOODCHAINETH","ROBINHOODMAINNET"}},
+    "ARC":{"emoji":"🟪","dex_chain":"arc","evm":True,"gas_usd":0.02,"explorer":"https://explorer.arc.io/token/","chain_id":None,"aliases":{"ARC","ARCCHAIN","ARCNETWORK","CIRCLEARC","ARCARC","ARCCHAINMAINNET","ARCMMAINNET"}},
+    "NEAR":{"emoji":"🟢","dex_chain":"near","evm":False,"near":True,"gas_usd":0.01,"explorer":"https://nearblocks.io/token/","chain_id":None,"aliases":{"NEAR","NEARPROTOCOL","NEARNEAR","NEARMAINNET","NEARTOKEN"}},
 }
 for _k,_c in CHAINS.items():
     _c["dex_chain"]=os.getenv(f"DEX_CHAIN_{_k}",_c["dex_chain"])
@@ -229,6 +229,10 @@ class MexcData:
         final={k:list(v.values()) for k,v in result.items()}
         for k,v in final.items():
             log.info("MEXC %s: %d token hop le",k,len(v))
+        if unmatched:
+            # log top 20 unmatched to debug why some chains 0
+            sample = list(unmatched)[:30]
+            log.info("MEXC unmatched networks sample: %s", sample)
         return final
     def ensure_static(self):
         with self.lock:
