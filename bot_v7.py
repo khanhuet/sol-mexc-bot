@@ -32,11 +32,11 @@ MIN_VOL_24H=env_float("MIN_VOL_24H",40000)
 MIN_TXNS_H1=int(env_float("MIN_TXNS_H1",15))
 MEXC_TAKER_FEE=env_float("MEXC_TAKER_FEE",0.002)
 COOLDOWN_MIN=env_float("COOLDOWN_MIN",25)
-SCAN_PAUSE_SEC=env_float("SCAN_PAUSE_SEC",20)
+SCAN_PAUSE_SEC=env_float("SCAN_PAUSE_SEC",40)
 STUCK_SEC=env_float("STUCK_SEC",900)
 STATIC_TTL=1800
 BOOK_TTL=10
-DEX_BATCH=20
+DEX_BATCH=30
 FOLLOWUP_MIN=(5,10)
 REAL_PRICE_CHECK=os.getenv("REAL_PRICE_CHECK","1")=="1"
 
@@ -86,7 +86,7 @@ class RateLimiter:
         if d>0:
             time.sleep(d)
 MEXC_LIMITER=RateLimiter(0.05)
-DEX_LIMITER=RateLimiter(0.35)
+DEX_LIMITER=RateLimiter(1.2)
 JUP_LIMITER=RateLimiter(0.2)
 PARA_LIMITER=RateLimiter(0.3)
 
@@ -740,7 +740,7 @@ def scan_chain_once(chain_key, stop):
             if prefilter(chain_key, tok, pool, book):
                 candidates.append((tok, pool))
         if candidates:
-            with ThreadPoolExecutor(max_workers=3) as ex:
+            with ThreadPoolExecutor(max_workers=2) as ex:
                 results=list(ex.map(lambda c: check_candidate(chain_key, c[0], c[1]), candidates))
             for res in results:
                 if not res:
@@ -754,7 +754,7 @@ def scan_chain_once(chain_key, stop):
                     st.inc("signals")
                     row_id=DB.insert(chain_key, tok, pool, p)
                     schedule_followups(row_id, chain_key, tok, p["direction"])
-        stop.wait(1)
+        stop.wait(2.5)
     return True
 
 def run_chain_loop(chain_key, stop):
