@@ -199,9 +199,12 @@ class MexcData:
             if sym not in pairs.values():
                 continue
             for net in coin.get("networkList",[]) or []:
-                net_name=(net.get("network") or "").upper().replace(" ","")
+                import re as _re
+                net_name=_re.sub(r"[^A-Z0-9]", "", (net.get("network") or "").upper())
                 contract=net.get("contract") or ""
-                if not net.get("withdrawEnable") or not net.get("depositEnable"):
+                # truoc: yeu cau ca rut va nap deu mo -> de bi 0 token khi MEXC khoa 1 chieu
+                # sua: chi can 1 chieu mo la van lay de quet 1 chieu arbitrage
+                if not (net.get("withdrawEnable") or net.get("depositEnable")):
                     continue
                 found=None
                 for ch,cfg in CHAINS.items():
