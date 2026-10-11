@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
-BOT V7.1 - MEXC <-> DEX arbitrage with REAL price check
-- All chains use real execution price (Jupiter SOL, Paraswap EVM)
-- Dexscreener only for discovery
-- Strong fake filter
+BOT V7.1 - REAL PRICE - MEXC <-> DEX with Jupiter + Paraswap
 """
-
 import hashlib, hmac, html, json, logging, os, re, sqlite3, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -15,7 +11,7 @@ import requests
 def require_env(name):
     v=os.environ.get(name)
     if not v:
-        sys.exit(f"Thieu bien moi truong bat buoc: {name}")
+        sys.exit(f"Thieu bien moi truong: {name}")
     return v
 def env_float(name, default):
     return float(os.getenv(name, default))
@@ -45,8 +41,10 @@ FOLLOWUP_MIN=(5,10)
 REAL_PRICE_CHECK=os.getenv("REAL_PRICE_CHECK","1")=="1"
 
 MEXC_BASE="https://api.mexc.com"
-WSOL_MINT="So11111111111111111111111111111111111111112"
-WNEAR="wrap.near"
+SOL_USDC="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+SOL_USDT="Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+EVM_USDC={56:"0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",8453:"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",1:"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",137:"0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",42161:"0xaf88d065e77c8cC2239327C5EDb3A432268e5831"}
+EVM_USDT={56:"0x55d398326f99059fF775485246999027B3197955",8453:"0x50c5725949A6F0c72E6F4a641F24049A917DB138",1:"0xdAC17F958D2ee523a2206206994597C13D831ec7",137:"0xc2132D05D31c914a87C6611C10748AEb04B58e8F",42161:"0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"}
 
 CHAINS={
     "SOL":{"emoji":"🟣","dex_chain":"solana","evm":False,"gas_usd":0.02,"explorer":"https://solscan.io/token/","chain_id":None,"aliases":{"SOL","SOLANA","SOLANASOL"}},
@@ -66,10 +64,6 @@ CHAINS={k:v for k,v in CHAINS.items() if k in ENABLED}
 
 DEX_FEES={"uniswap":0.003,"pancakeswap":0.0025,"sushiswap":0.003,"quickswap":0.003,"aerodrome":0.003,"camelot":0.003,"raydium":0.0025,"orca":0.003,"meteora":0.003}
 DEFAULT_DEX_FEE=0.003
-SOL_USDC="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-SOL_USDT="Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
-EVM_USDC={56:"0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",8453:"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",1:"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",137:"0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",42161:"0xaf88d065e77c8cC2239327C5EDb3A432268e5831"}
-EVM_USDT={56:"0x55d398326f99059fF775485246999027B3197955",8453:"0x50c5725949A6F0c72E6F4a641F24049A917DB138",1:"0xdAC17F958D2ee523a2206206994597C13D831ec7",137:"0xc2132D05D31c914a87C6611C10748AEb04B58e8F",42161:"0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"}
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"),format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s")
 log=logging.getLogger("bot")
@@ -146,7 +140,6 @@ class Stat:
         self.c={"attempted":0,"fetched":0,"opportunity":0,"signals":0,"suspect":0,"errors":0,"dex_pairs":0,"real_price_ok":0,"real_price_fail":0}
         self.last_beat=datetime.now()
         self.last_success=None
-        self._scanned=0
     def inc(self,k,n=1):
         with self.lock:
             self.c[k]=self.c.get(k,0)+n
@@ -157,8 +150,7 @@ class Stat:
         with self.lock:
             self.last_success=datetime.now()
     def scanned(self):
-        with self.lock:
-            self._scanned+=1
+        pass
     def snapshot(self):
         with self.lock:
             d=dict(self.c)
@@ -179,6 +171,7 @@ class MexcData:
         self.book_ts=0
         self.retry_after=0
     def _fetch_pairs(self):
+        log.info("Dang lay exchangeInfo MEXC...")
         r=http_get(f"{MEXC_BASE}/api/v3/exchangeInfo",limiter=MEXC_LIMITER,timeout=20)
         if not r:
             raise RuntimeError("exchangeInfo no response")
@@ -189,15 +182,18 @@ class MexcData:
         for s in data.get("symbols",[]):
             if s.get("quoteAsset")=="USDT" and s.get("status")=="1":
                 out[s["symbol"]]=s["baseAsset"]
+        log.info("Lay duoc %d pairs", len(out))
         return out
     def _fetch_tokens(self,pairs):
+        log.info("Dang lay capital/config...")
         r=mexc_signed_get("/api/v3/capital/config/getall")
         if not r:
-            raise RuntimeError(f"capital/config no response")
+            raise RuntimeError("capital/config no response")
         if r.status_code!=200:
-            raise RuntimeError(f"capital/config fail {r.status_code} {r.text[:200]}")
+            raise RuntimeError(f"capital/config fail {r.status_code} {r.text[:300]}")
         coins=r.json()
         result={k:{} for k in CHAINS}
+        unmatched=set()
         for coin in coins:
             sym=coin.get("coin")
             if sym not in pairs.values():
@@ -213,11 +209,21 @@ class MexcData:
                         found=ch
                         break
                 if not found:
+                    unmatched.add(net_name)
                     continue
                 dedup=norm_addr(found, contract if contract else sym)
                 if dedup in result[found]:
                     continue
-                result[found][dedup]={"symbol":sym,"contract":contract or sym,"dedup_key":dedup,"chain":found,"pair":next((p for p,s in pairs.items() if s==sym),sym+"USDT"),"raw_network":net.get("network"),"withdraw_fee":fnum(net.get("withdrawFee")),"withdraw_min":fnum(net.get("withdrawMin"))}
+                result[found][dedup]={
+                    "symbol":sym,
+                    "contract":contract or sym,
+                    "dedup_key":dedup,
+                    "chain":found,
+                    "pair":next((p for p,s in pairs.items() if s==sym), sym+"USDT"),
+                    "raw_network":net.get("network"),
+                    "withdraw_fee":fnum(net.get("withdrawFee")),
+                    "withdraw_min":fnum(net.get("withdrawMin")),
+                }
         final={k:list(v.values()) for k,v in result.items()}
         for k,v in final.items():
             log.info("MEXC %s: %d token hop le",k,len(v))
@@ -225,24 +231,21 @@ class MexcData:
     def ensure_static(self):
         with self.lock:
             now=time.time()
-            if self.tokens and now-self.ts < STATIC_TTL:
+            if self.tokens and now-self.ts < 1800:
                 return
             if now < self.retry_after:
-                # log every time we skip due to retry_after to debug
-                log.warning("MEXC retry_after chua het, bo qua %.0fs", self.retry_after-now)
+                log.warning("MEXC retry_after con %.0fs, bo qua", self.retry_after-now)
                 return
             try:
-                log.info("Dang lay exchangeInfo MEXC...")
                 pairs=self._fetch_pairs()
-                log.info("Lay duoc %d pairs, dang lay capital/config...", len(pairs))
                 tokens=self._fetch_tokens(pairs)
                 self.pairs,self.tokens,self.ts=pairs,tokens,now
             except Exception as e:
-                log.error("Lam moi du lieu MEXC loi: %s",e)
+                log.error("Lam moi du lieu MEXC loi: %s", e)
                 self.retry_after=now+60
     def get_book(self):
         with self.book_lock:
-            if self.book and time.time()-self.book_ts < BOOK_TTL:
+            if self.book and time.time()-self.book_ts < 10:
                 return self.book
             r=http_get(f"{MEXC_BASE}/api/v3/ticker/bookTicker",limiter=MEXC_LIMITER,timeout=20)
             if r and r.status_code==200:
@@ -632,9 +635,9 @@ def send_telegram(text):
 def send_alert(chain_key, tok, pool, p):
     cfg=CHAINS[chain_key]
     if p["direction"]=="MEXC_TO_DEX":
-        action=f"MUA MEXC {tok['pair']} → rut ve {chain_key} → BAN tren DEX"
+        action=f"MUA MEXC {tok['pair']} -> rut ve {chain_key} -> BAN tren DEX"
     else:
-        action=f"MUA tren {chain_key} DEX → nap len MEXC → BAN {tok['pair']}"
+        action=f"MUA tren {chain_key} DEX -> nap len MEXC -> BAN {tok['pair']}"
     bid,ask=p["mexc_best"]
     src=p.get("real_source","estimate")
     msg=(f"{cfg['emoji']} <b>Abrigate {esc(tok['symbol'])} [{chain_key}]</b> (paper) [{esc(src)}]\n\n"
@@ -650,7 +653,7 @@ def send_alert(chain_key, tok, pool, p):
          f"🔗 MEXC: https://www.mexc.com/exchange/{esc(tok['pair'])}\n"
          f"🔗 DEX: {esc(pool['url'])}\n"
          f"🔗 Explorer: {esc(cfg['explorer'] + tok['contract'])}\n\n"
-         f"⚠ Chi la mo phong gia thuc te ({esc(src)}). Gia co the doi trong luc chuyen.\n"
+         f"⚠ Chi la mo phong gia thuc te ({esc(src)}). Gia co the doi.\n"
          f"⏰ {datetime.now().strftime('%H:%M:%S %d/%m')}")
     return send_telegram(msg)
 
@@ -785,9 +788,7 @@ def heartbeat_loop():
             msg=(f"💓 <b>HEARTBEAT {datetime.now().strftime('%H:%M %d/%m')}</b>\nNet ≥ {THRESHOLD_NET}% | Order ${ORDER_SIZE_USD:.0f} | RealCheck={REAL_PRICE_CHECK}\n\n")
             for k,st in STATS.items():
                 s=st.snapshot()
-                ls=STATS[k].last_success
-                status="✅"
-                msg+=(f"{CHAINS[k]['emoji']} {k}: try={s['attempted']} fetch={s['fetched']} opp={s['opportunity']} sig={s['signals']} sus={s['suspect']} realOK={s['real_price_ok']} err={s['errors']} | {status}\n")
+                msg+=(f"{CHAINS[k]['emoji']} {k}: try={s['attempted']} fetch={s['fetched']} opp={s['opportunity']} sig={s['signals']} sus={s['suspect']} realOK={s['real_price_ok']} err={s['errors']}\n")
             send_telegram(msg)
         except Exception:
             log.exception("Heartbeat loi")
