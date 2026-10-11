@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BOT V8.1 FINAL - MERGED - MEXC <-> DEX arbitrage (PAPER)
+BOT V8.2 - FIX MASK TAX 3% + MEXC CONTRACT NOTIFY - MEXC <-> DEX arbitrage (PAPER)
 Base: V8.0 user (decimals via RPC, risk buffer, adaptive, blacklist, telegram commands)
 + Fixes: WSOL for SOL native, LRU cache, strict symbol_ok, circuit breaker
 """
@@ -372,19 +372,38 @@ class MexcData:
                 new_status = {}
                 for ch, lst in tokens.items():
                     for t in lst:
-                        new_status[(ch, t["dedup_key"])] = (t["withdraw_enable"], t["deposit_enable"], t["symbol"])
+                        # V8.2: luu them contract de thong bao
+                        new_status[(ch, t["dedup_key"])] = (t["withdraw_enable"], t["deposit_enable"], t["symbol"], t["contract"])
                 if self.status:
-                    for k, (w, d, sym) in new_status.items():
+                    for k, vals in new_status.items():
+                        w, d, sym, contract = vals
                         old = self.status.get(k)
-                        if old and ((not old[0] and w) or (not old[1] and d)):
-                            changes.append(f"{sym} [{k[0]}] nap {'✅' if d else '❌'} rut {'✅' if w else '❌'}")
+                        if old:
+                            ow, od = old[0], old[1]
+                            # Mo lai
+                            if (not ow and w) or (not od and d):
+                                changes.append(f"MO LAI {sym} [{k[0]}] nap {'✅' if d else '❌'} rut {'✅' if w else '❌'}\nContract: {contract}")
+                            # Dong lai
+                            elif (ow and not w) or (od and not d):
+                                changes.append(f"DONG {sym} [{k[0]}] nap {'✅' if d else '❌'} rut {'✅' if w else '❌'}\nContract: {contract}")
                 self.status = new_status
                 self.pairs, self.tokens, self.ts = pairs, tokens, now
             except Exception as e:
                 log.error("Lam moi MEXC loi: %s", e)
                 self.retry_after = now + 60
         if changes:
-            send_telegram("🔓 <b>MEXC vua MO LAI nap/rut</b>:\n" + "\n".join(esc(c) for c in changes[:20]))
+            # V8.2: thong bao ca dong va mo, kem contract
+            open_msgs = []
+            close_msgs = []
+            for line in changes:
+                if "MO LAI" in line or "✅" in line:
+                    open_msgs.append(line)
+                else:
+                    close_msgs.append(line)
+            if open_msgs:
+                send_telegram("🔓 <b>MEXC vua MO LAI nap/rut</b>:\n" + "\n".join(esc(c) for c in open_msgs[:20]))
+            if close_msgs:
+                send_telegram("🔒 <b>MEXC vua DONG nap/rut</b>:\n" + "\n".join(esc(c) for c in close_msgs[:20]))
     def get_book(self):
         with self.book_lock:
             if self.book and time.time() - self.book_ts < BOOK_TTL:
@@ -528,7 +547,35 @@ def get_decimals(chain_key, contract):
         with DEC_LOCK:
             DEC_CACHE[key] = int(dec)
         return int(dec)
-    return None
+
+def get_sol_transfer_fee(contract):
+    """Lay transfer fee cua Token-2022 (basis points), VD 3% = 300"""
+    try:
+        # getAccountInfo with jsonParsed to read extensions
+        j = rpc_post(SOL_RPC, {"jsonrpc": "2.0", "id": 1, "method": "getAccountInfo", "params": [contract, {"encoding": "jsonParsed"}]})
+        data = (((j or {}).get("result") or {}).get("value") or {}).get("data") or {}
+        if isinstance(data, dict):
+            parsed = data.get("parsed") or {}
+            info = parsed.get("info") or {}
+            exts = info.get("extensions") or []
+            for ext in exts:
+                if ext.get("extension") == "transferFeeConfig":
+                    state = ext.get("state") or {}
+                    fee = state.get("transferFeeConfig") or {}
+                    # newer format
+                    newer = state.get("newerTransferFee") or {}
+                    older = state.get("olderTransferFee") or {}
+                    # try both
+                    bp = newer.get("transferFeeBasisPoints") or older.get("transferFeeBasisPoints") or fee.get("transferFeeBasisPoints")
+                    if bp is not None:
+                        return float(bp)/100.0/100.0  # 300 -> 0.03
+        # fallback: try get token supply extension check
+        j2 = rpc_post(SOL_RPC, {"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [contract]})
+        # no fee info here, return 0
+    except Exception as e:
+        log.debug("transfer fee check loi %s: %s", contract[:8], e)
+    return 0.0
+
 
 def jup_quote(input_mint, output_mint, amount_raw):
     params = {"inputMint": input_mint, "outputMint": output_mint, "amount": str(int(amount_raw)),
@@ -650,6 +697,17 @@ def get_security(chain_key, contract):
                        "soft": [f for f in SOFT_FLAGS if str(data.get(f)) == "1"]}
     except Exception as e:
         log.warning("GoPlus parse loi %s: %s", contract[:8], e)
+    # V8.2: SOL Token-2022 transfer fee fallback if GoPlus miss
+    if chain_key == "SOL" and sec.get("buy_tax",0) == 0 and sec.get("sell_tax",0) == 0:
+        try:
+            tf = get_sol_transfer_fee(contract)
+            if tf > 0:
+                sec["buy_tax"] = tf
+                sec["sell_tax"] = tf
+                sec["known"] = True
+                log.info("Phat hien transfer fee SOL %s %.2f%%", contract[:8], tf*100)
+        except:
+            pass
     with SEC_LOCK:
         SEC_CACHE[key] = (time.time(), sec)
         if len(SEC_CACHE) > SEC_CACHE_MAX:
@@ -726,16 +784,19 @@ def evaluate(chain_key, tok, pool, depth):
                     revenue = usd_out * (1 - EXTRA_SLIPPAGE) * (1 - sell_tax) - gas
                     net = revenue - cost
                     net_pct = net / cost * 100
-                    if -5 < gross <= MAX_GROSS and impact <= MAX_IMPACT_PCT:
-                        if abs(sell_px - pool["price"]) / pool["price"] > 0.15:
+                    # V8.2: impact thuc te = max(jupiter impact, dexscreener estimate) + check lech gia vs pool
+                    real_impact = max(impact or 0, impact_est)
+                    if -5 < gross <= MAX_GROSS and real_impact <= MAX_IMPACT_PCT and impact <= 2.5:
+                        if abs(sell_px - pool["price"]) / pool["price"] > 0.12:
                             st.inc("suspect")
+                            log.info("LOAI LECH GIA LON %s %s sell %.6f vs dex %.6f diff %.1f%%", chain_key, tok["symbol"], sell_px, pool["price"], abs(sell_px-pool["price"])/pool["price"]*100)
                         else:
                             out.append(dict(common, direction="MEXC_TO_DEX", token_amount=tokens,
                                             token_after_tax=tokens_net * (1 - sell_tax), mexc_avg=avg,
                                             dex_exec=sell_px, cost=cost, net_usd=net, net_pct=net_pct,
                                             adj_net_pct=net_pct - buf, gross_pct=gross,
                                             gross_after_tax=gross - sell_tax * 100, gas=gas,
-                                            withdraw_fee_usd=tok["withdraw_fee"] * avg, impact_dex=impact,
+                                            withdraw_fee_usd=tok["withdraw_fee"] * avg, impact_dex=real_impact,
                                             real_source=src))
     if tok.get("deposit_enable", True):
         q = dex_buy_quote(chain_key, tok["contract"], dec, usd) if can_real else None
@@ -760,15 +821,17 @@ def evaluate(chain_key, tok, pool, depth):
                 avg = proceeds / tokens_dep
                 gross = (avg / buy_px - 1) * 100
                 net_pct = net / cost * 100
-                if -5 < gross <= MAX_GROSS and impact <= MAX_IMPACT_PCT:
-                    if abs(buy_px - pool["price"]) / pool["price"] > 0.15:
+                real_impact = max(impact or 0, impact_est)
+                if -5 < gross <= MAX_GROSS and real_impact <= MAX_IMPACT_PCT and impact <= 2.5:
+                    if abs(buy_px - pool["price"]) / pool["price"] > 0.12:
                         st.inc("suspect")
+                        log.info("LOAI LECH GIA LON %s %s buy %.6f vs dex %.6f diff %.1f%%", chain_key, tok["symbol"], buy_px, pool["price"], abs(buy_px-pool["price"])/pool["price"]*100)
                     else:
                         out.append(dict(common, direction="DEX_TO_MEXC", token_amount=tokens_dep,
                                         token_raw=tokens_out, mexc_avg=avg, dex_exec=buy_px, cost=cost,
                                         net_usd=net, net_pct=net_pct, adj_net_pct=net_pct - buf,
                                         gross_pct=gross, gross_after_tax=gross - buy_tax * 100, gas=gas * 2,
-                                        withdraw_fee_usd=0.0, impact_dex=impact, real_source=src))
+                                        withdraw_fee_usd=0.0, impact_dex=real_impact, real_source=src))
     return out
 
 COOLDOWN = {}
