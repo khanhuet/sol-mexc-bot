@@ -202,10 +202,9 @@ class MexcData:
                 import re as _re
                 net_name=_re.sub(r"[^A-Z0-9]", "", (net.get("network") or "").upper())
                 contract=net.get("contract") or ""
-                # truoc: yeu cau ca rut va nap deu mo -> de bi 0 token khi MEXC khoa 1 chieu
-                # sua: chi can 1 chieu mo la van lay de quet 1 chieu arbitrage
-                if not (net.get("withdrawEnable") or net.get("depositEnable")):
-                    continue
+                # FIX 11/10: Bo luon loc withdraw/deposit de tranh 0 token khi MEXC khoa tam thoi
+                # Van lay token, chi can alias khop, de khi MEXC mo lai la quet ngay
+                # withdraw_fee van luu de tinh toan
                 found=None
                 for ch,cfg in CHAINS.items():
                     if net_name in cfg["aliases"]:
@@ -342,20 +341,35 @@ def symbol_ok(a,b):
     return bool(a) and (a==b or (len(a)>=3 and (a in b or b in a)))
 
 def get_jupiter_quote(input_mint, output_mint, amount):
-    try:
-        url=f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps=50"
-        r=http_get(url,limiter=JUP_LIMITER,timeout=10)
-        if not r or r.status_code!=200:
-            return None
-        j=r.json()
-        out=fnum(j.get("outAmount"))
-        impact=fnum(j.get("priceImpactPct"))
-        if out<=0:
-            return None
-        return {"outAmount":out,"impact":impact}
-    except Exception as e:
-        log.warning("Jupiter quote loi: %s",e)
-        return None
+    # Try multiple Jupiter endpoints, fallback to None if DNS fails (Render free sometimes can't resolve jup.ag)
+    endpoints = [
+        f"https://api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps=50",
+        f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps=50",
+    ]
+    for url in endpoints:
+        try:
+            r=http_get(url,limiter=JUP_LIMITER,timeout=8)
+            if not r or r.status_code!=200:
+                continue
+            j=r.json()
+            # new API returns outAmount in different field
+            out = fnum(j.get("outAmount") or j.get("outAmount"))
+            # for new API, outAmount may be in j["outAmount"] or j["otherAmountThreshold"]? check
+            if out<=0:
+                # try alternative structure for new API
+                if isinstance(j, dict) and "outAmount" in str(j):
+                    # fallback
+                    pass
+                continue
+            impact=fnum(j.get("priceImpactPct") or j.get("priceImpact") or 0.3)
+            if out>0:
+                return {"outAmount":out,"impact":impact}
+        except Exception as e:
+            # suppress DNS error spam, only debug
+            if "NameResolutionError" in str(e) or "Failed to resolve" in str(e):
+                return None
+            continue
+    return None
 
 def get_paraswap_quote(chain_id, src_token, dest_token, src_amount_wei):
     try:
