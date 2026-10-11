@@ -32,7 +32,7 @@ THRESHOLD_NET = env_float("THRESHOLD_NET", 0.8)
 PREFILTER_GROSS = env_float("PREFILTER_GROSS", 0.8)
 MAX_GROSS = env_float("MAX_GROSS", 7.0)
 MAX_IMPACT_PCT = env_float("MAX_IMPACT_PCT", 0.8)
-MIN_LIQ_USD = env_float("MIN_LIQ_USD", 80000)
+MIN_LIQ_USD = env_float("MIN_LIQ_USD", 90000)
 MIN_VOL_24H = env_float("MIN_VOL_24H", 40000)
 MIN_TXNS_H1 = int(env_float("MIN_TXNS_H1", 15))
 MIN_POOL_AGE_H = env_float("MIN_POOL_AGE_H", 24)
@@ -690,7 +690,7 @@ def evaluate(chain_key, tok, pool, depth):
     buy_tax, sell_tax = sec["buy_tax"], sec["sell_tax"]
     dec = get_decimals(chain_key, tok["contract"]) if (REAL_PRICE_CHECK and chain_key in REAL_CHAINS) else None
     can_real = dec is not None
-    if not can_real and REQUIRE_REAL_PRICE:
+    if not can_real and REQUIRE_REAL_PRICE and chain_key in REAL_CHAINS:
         st.inc("real_price_fail")
         return []
     impact_est, buy_est, sell_est = dex_prices_estimate(pool)
@@ -713,10 +713,11 @@ def evaluate(chain_key, tok, pool, depth):
                     usd_out, impact, src = q["usd_out"], q["impact"], q["source"]
                     if impact is None:
                         impact = impact_est
-                elif REQUIRE_REAL_PRICE:
+                elif REQUIRE_REAL_PRICE and chain_key in REAL_CHAINS:
                     st.inc("real_price_fail")
                     usd_out = None
                 else:
+                    # ROBINHOOD, ARC, NEAR: cho phep estimate du REQUIRE_REAL_PRICE=1
                     usd_out, impact, src = tokens_net * sell_est, impact_est, "estimate"
                 if usd_out:
                     sell_px = usd_out / tokens_net
@@ -743,7 +744,7 @@ def evaluate(chain_key, tok, pool, depth):
             tokens_out, buy_px, impact, src = q["tokens"], q["price"], q["impact"], q["source"]
             if impact is None:
                 impact = impact_est
-        elif REQUIRE_REAL_PRICE:
+        elif REQUIRE_REAL_PRICE and chain_key in REAL_CHAINS:
             st.inc("real_price_fail")
             tokens_out = None
         else:
@@ -1307,7 +1308,8 @@ def validate_config():
         warns.append("REAL_PRICE_CHECK=0 nhung REQUIRE_REAL_PRICE=1 -> bot se khong gui signal")
     for k in CHAINS:
         if k not in REAL_CHAINS and REQUIRE_REAL_PRICE:
-            warns.append(f"{k} chua ho tro quote that -> bi chan boi REQUIRE_REAL_PRICE")
+            # V8.1: cho phep all chain, chi canh bao nhe
+            log.info("INFO: %s chua ho tro quote that -> se dung gia estimate + buffer cao hon", k)
     for w in warns:
         log.warning("CONFIG: %s", w)
     return warns
