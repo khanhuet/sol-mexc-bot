@@ -555,6 +555,35 @@ def followup_loop():
                 log.warning("Follow-up lỗi: %s", e)
             DB.set_followup(f["id"], f["minutes"], value)
 
+def fmt_price(v):
+    # Format full decimal, no scientific notation e-08
+    try:
+        if v is None:
+            return "0"
+        v = float(v)
+        if v == 0:
+            return "0"
+        if abs(v) >= 1:
+            # >=1 -> 6 decimals, keep trailing zeros
+            return f"{v:.6f}"
+        elif abs(v) >= 0.01:
+            return f"{v:.8f}"
+        else:
+            # very small like 0.000000066 -> 12 decimals
+            return f"{v:.12f}"
+    except:
+        return str(v)
+
+def fmt_token_amount(v):
+    try:
+        v = float(v)
+        if v >= 1000:
+            return f"{v:,.0f}"
+        else:
+            return f"{v:.6f}"
+    except:
+        return str(v)
+
 def send_alert(chain_key, tok, pool, p):
     cfg = CHAINS[chain_key]
     if p["direction"] == "MEXC_TO_DEX":
@@ -563,14 +592,14 @@ def send_alert(chain_key, tok, pool, p):
         action = f"MUA trên {chain_key} DEX → nạp lên MEXC → BÁN {tok['pair']}"
     bid, ask = p["mexc_best"]
     msg = (
-        f"{cfg['emoji']} <b>ARB {esc(tok['symbol'])} [{chain_key}]</b> (paper)\n\n"
+        f"{cfg['emoji']} <b>Abrigate {esc(tok['symbol'])} [{chain_key}]</b> (paper)\n\n"
         f"Contract: <code>{esc(tok['contract'])}</code>\n"
         f"DEX: {esc(pool['dex'])} | {esc(pool['pair_name'])} | fee ~{pool['fee']*100:.2f}%\n"
         f"Liq: ${pool['liq']:,.0f} | Vol24h: ${pool['vol24']:,.0f} | Txns1h: {pool['txns_h1']}\n\n"
-        f"MEXC {esc(tok['pair'])}: bid/ask {bid:.8g}/{ask:.8g} | giá TB ${p['mexc_avg']:.8g}\n"
-        f"DEX: giá ${pool['price']:.8g} | giá thực thi ${p['dex_exec']:.8g} | impact ~{p['impact_dex']:.2f}%\n\n"
-        f"💰 <b>NET {p['net_pct']:.3f}% (${p['net_usd']:.2f})</b> | Gross {p['gross_pct']:.3f}%\n"
-        f"Vốn ${ORDER_SIZE_USD:.0f} | Token {p['token_amount']:.6g}\n"
+        f"MEXC {esc(tok['pair'])}: bid/ask {fmt_price(bid)}/{fmt_price(ask)} | giá TB ${fmt_price(p['mexc_avg'])}\n"
+        f"DEX: giá ${fmt_price(pool['price'])} | giá thực thi ${fmt_price(p['dex_exec'])} | impact ~{p['impact_dex']:.2f}%\n\n"
+        f"💰 <b>NET {p['net_pct']:.4f}% (${p['net_usd']:.2f})</b> | Gross {p['gross_pct']:.4f}%\n"
+        f"Vốn ${ORDER_SIZE_USD:.0f} | Token {fmt_token_amount(p['token_amount'])}\n"
         f"Gas ${p['gas']:.2f} | Phí rút ${p['withdraw_fee_usd']:.2f} | Phí MEXC {MEXC_TAKER_FEE*100:.2f}%\n"
         f"🎯 {esc(action)}\n\n"
         f"🔗 MEXC: https://www.mexc.com/exchange/{esc(tok['pair'])}\n"
