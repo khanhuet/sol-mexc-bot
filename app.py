@@ -6,15 +6,15 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot V9.0 9 CEX + Deposit Alert + WS Live - Running!"
+    return "Bot V10.0 MERGED - MEXC+GATE+BYBIT+BINANCE - Running!"
 
 @app.route('/health')
 def health():
     return "OK", 200
 
 def run_bot():
-    target = "bot_v7.py"
-    print(f"[APP V9.0] Starting {target} - Full 9 CEX Deposit Monitor")
+    target = "bot_v10.py"
+    print(f"[APP V10] Starting {target} - MERGED FINAL")
     while True:
         try:
             result = subprocess.run([sys.executable, target])
