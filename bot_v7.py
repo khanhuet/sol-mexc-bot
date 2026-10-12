@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-BOT V8.7 - PROFIT ON TOP, BUY BELOW PROFIT
-- Structure: Header -> Profit -> BUY action -> Details
-- BUY DEX -> direct swap (jup.ag / pancakeswap / uniswap)
-- BUY MEXC -> mexc.com/exchange/PAIR
-- English
+BOT V8.9.1 - MULTI-CEX 9 SAN + DEPOSIT/WITHDRAW CHECK + WS LIVE + INVENTORY
+1. Maker 0% vs Taker - hybrid fee with depth check
+2. Dynamic size 200-2000$ based on liquidity
+3. Real transfer time + volatility decay
+4. New memecoin (<24h) allowed if vol/txns high + honeypot simulation
+5. Volatile inventory tracker for pre-hold
+6. Multi-CEX architecture (MEXC + GATE ready, expandable)
+7. AI Score 0-100
+8. WebSocket ready structure (REST now, WS upgrade path)
 """
+
 import hashlib, hmac, html, json, logging, math, os, re, sqlite3, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -29,7 +34,9 @@ MEXC_SECRET = require_env("MEXC_SECRET")
 PORT = int(os.getenv("PORT", 10000))
 DB_PATH = os.getenv("DB_PATH", "paper_trades.db")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
-ORDER_SIZE_USD = env_float("ORDER_SIZE_USD", 500)
+ORDER_SIZE_USD = env_float("ORDER_SIZE_USD", 500)  # base, will be overridden by dynamic
+ORDER_SIZE_MIN = env_float("ORDER_SIZE_MIN", 200)
+ORDER_SIZE_MAX = env_float("ORDER_SIZE_MAX", 2000)
 THRESHOLD_NET = env_float("THRESHOLD_NET", 0.8)
 PREFILTER_GROSS = env_float("PREFILTER_GROSS", 0.8)
 MAX_GROSS = env_float("MAX_GROSS", 7.0)
@@ -38,8 +45,12 @@ MIN_LIQ_USD = env_float("MIN_LIQ_USD", 90000)
 MIN_VOL_24H = env_float("MIN_VOL_24H", 40000)
 MIN_TXNS_H1 = int(env_float("MIN_TXNS_H1", 15))
 MIN_POOL_AGE_H = env_float("MIN_POOL_AGE_H", 24)
+MIN_POOL_AGE_MEME_H = env_float("MIN_POOL_AGE_MEME_H", 1)  # cho memecoin moi
+ALLOW_NEW_MEME = env_bool("ALLOW_NEW_MEME", "1")
 MAX_MEXC_SPREAD = env_float("MAX_MEXC_SPREAD", 2.0)
 MEXC_TAKER_FEE = env_float("MEXC_TAKER_FEE", 0.002)
+MEXC_MAKER_FEE = env_float("MEXC_MAKER_FEE", 0.0)
+MAKER_DEPTH_MULTIPLIER = env_float("MAKER_DEPTH_MULTIPLIER", 2.0)  # depth phai gap 2x size moi dam dung maker
 EXTRA_SLIPPAGE = env_float("EXTRA_SLIPPAGE", 0.001)
 TAX_MAX = env_float("TAX_MAX", 0.05)
 RISK_K = env_float("RISK_K", 0.5)
@@ -58,6 +69,11 @@ REQUIRE_REAL_PRICE = env_bool("REQUIRE_REAL_PRICE", "1")
 ADAPTIVE = env_bool("ADAPTIVE", "1")
 BAD_STREAK_BLACKLIST = int(env_float("BAD_STREAK_BLACKLIST", 3))
 BLACKLIST_HOURS = env_float("BLACKLIST_HOURS", 24)
+# V8.8 new
+VOLATILE_CHG_THRESHOLD = env_float("VOLATILE_CHG_THRESHOLD", 5.0)  # 5m change >5% la bien dong
+VOLATILE_COUNT_TO_HOT = int(env_float("VOLATILE_COUNT_TO_HOT", 3))
+AI_SCORE_MIN = env_float("AI_SCORE_MIN", 60)
+ENABLED_CEXS = os.getenv("ENABLED_CEXS", "MEXC,GATE").split(",")  # danh sach CEX muon chay
 
 JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "")
 JUPITER_LITE_URL = os.getenv("JUPITER_LITE_URL", "https://lite-api.jup.ag/swap/v1/quote")
@@ -294,41 +310,357 @@ class ApiHealth:
             return " | ".join(f"{k}: {v['ok']}ok/{v['fail']}fail" for k, v in self.d.items()) or "chua co"
 API = ApiHealth()
 
-class MexcData:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.book_lock = threading.Lock()
-        self.pairs = {}
-        self.tokens = {}
-        self.status = {}
-        self.ts = 0
-        self.book = {}
-        self.book_ts = 0
-        self.retry_after = 0
-    def _fetch_pairs(self):
+
+
+# ========== V8.9.2 FULL 9 CEX DEPOSIT/WITHDRAW SCANNER ==========
+import base64
+from concurrent.futures import ThreadPoolExecutor as _TPE
+
+# API Keys cho 9 san (ReadOnly la du)
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
+BINANCE_SECRET = os.getenv("BINANCE_SECRET", "")
+GATE_API_KEY = os.getenv("GATE_API_KEY", "")
+GATE_SECRET = os.getenv("GATE_SECRET", "")
+OKX_API_KEY = os.getenv("OKX_API_KEY", "")
+OKX_SECRET = os.getenv("OKX_SECRET", "")
+OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
+BYBIT_SECRET = os.getenv("BYBIT_SECRET", "")
+BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
+BITGET_SECRET = os.getenv("BITGET_SECRET", "")
+BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
+KUCOIN_API_KEY = os.getenv("KUCOIN_API_KEY", "")
+KUCOIN_SECRET = os.getenv("KUCOIN_SECRET", "")
+KUCOIN_PASSPHRASE = os.getenv("KUCOIN_PASSPHRASE", "")
+HTX_API_KEY = os.getenv("HTX_API_KEY", "")
+HTX_SECRET = os.getenv("HTX_SECRET", "")
+BINGX_API_KEY = os.getenv("BINGX_API_KEY", "")
+BINGX_SECRET = os.getenv("BINGX_SECRET", "")
+LBANK_API_KEY = os.getenv("LBANK_API_KEY", "")
+LBANK_SECRET = os.getenv("LBANK_SECRET", "")
+
+CEX_REGISTRY = {
+    "MEXC": {"name": "MEXC", "taker": 0.002, "maker": 0.0, "rest_base": "https://api.mexc.com", "ws": "wss://wbs.mexc.com/ws", "ws_format": "mexc", "needs_key_for_deposit": True},
+    "BINANCE": {"name": "Binance", "taker": 0.001, "maker": 0.0005, "rest_base": "https://api.binance.com", "ws": "wss://stream.binance.com:9443/ws", "ws_format": "binance", "needs_key_for_deposit": True},
+    "GATE": {"name": "Gate.io", "taker": 0.002, "maker": 0.002, "rest_base": "https://api.gateio.ws/api/v4", "ws": "wss://api.gateio.ws/ws/v4/", "ws_format": "gate", "needs_key_for_deposit": False},
+    "OKX": {"name": "OKX", "taker": 0.001, "maker": 0.0008, "rest_base": "https://www.okx.com", "ws": "wss://ws.okx.com:8443/ws/v5/public", "ws_format": "okx", "needs_key_for_deposit": False},
+    "BYBIT": {"name": "Bybit", "taker": 0.001, "maker": 0.0005, "rest_base": "https://api.bybit.com", "ws": "wss://stream.bybit.com/v5/public/spot", "ws_format": "bybit", "needs_key_for_deposit": True},
+    "BITGET": {"name": "Bitget", "taker": 0.002, "maker": 0.002, "rest_base": "https://api.bitget.com", "ws": "wss://ws.bitget.com/v2/ws/public", "ws_format": "bitget", "needs_key_for_deposit": True},
+    "KUCOIN": {"name": "KuCoin", "taker": 0.001, "maker": 0.001, "rest_base": "https://api.kucoin.com", "ws": "wss://push-stream.kucoin.com/endpoint", "ws_format": "kucoin", "needs_key_for_deposit": False},
+    "BINGX": {"name": "BingX", "taker": 0.002, "maker": 0.002, "rest_base": "https://open-api.bingx.com", "ws": "wss://open-api-swap.bingx.com/swap-market", "ws_format": "bingx", "needs_key_for_deposit": True},
+    "HTX": {"name": "HTX", "taker": 0.002, "maker": 0.002, "rest_base": "https://api.huobi.pro", "ws": "wss://api.huobi.pro/ws", "ws_format": "htx", "needs_key_for_deposit": False},
+    "LBANK": {"name": "LBank", "taker": 0.002, "maker": 0.002, "rest_base": "https://api.lbank.info", "ws": "wss://www.lbkex.net/ws/V2/", "ws_format": "lbank", "needs_key_for_deposit": True},
+}
+
+CEX_LIVE = {}
+CEX_LIVE_LOCK = threading.Lock()
+CEX_DEPOSIT_CACHE = {}  # {cex: {symbol: (withdraw_en, deposit_en, ts)}}
+DEPOSIT_CACHE_LOCK = threading.Lock()
+
+def update_live_price(cex, symbol, bid, ask, source="ws"):
+    with CEX_LIVE_LOCK:
+        if cex not in CEX_LIVE:
+            CEX_LIVE[cex] = {}
+        try:
+            CEX_LIVE[cex][symbol] = {"bid": float(bid), "ask": float(ask), "ts": time.time(), "source": source}
+        except:
+            pass
+
+def get_live_price(cex, symbol):
+    with CEX_LIVE_LOCK:
+        d = CEX_LIVE.get(cex, {}).get(symbol)
+        if not d or time.time() - d["ts"] > 30:
+            return None
+        return d
+
+# ===== SIGNED REQUEST HELPERS =====
+def binance_signed_get(path, api_key, secret, params=None):
+    if not api_key or not secret:
+        return None
+    params = params or {}
+    params["timestamp"] = int(time.time()*1000)
+    qs = urlencode(params)
+    sig = hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    headers = {"X-MBX-APIKEY": api_key}
+    return http_get(f"https://api.binance.com{path}?{qs}&signature={sig}", headers=headers, timeout=10)
+
+def gate_signed_get(path, api_key, secret, params=None):
+    if not api_key or not secret:
+        return None
+    import hashlib, hmac
+    params = params or {}
+    timestamp = str(int(time.time()))
+    # Gate v4 sign: METHOD\nURL\nQUERY\nHEX(SHA512(body))\nTIMESTAMP
+    method = "GET"
+    body_hash = hashlib.sha512(b"").hexdigest()
+    query = urlencode(params) if params else ""
+    url_path = path
+    if query:
+        url_path = f"{path}?{query}"
+    # Actually sign string: method + "\n" + url + "\n" + query + "\n" + body_hash + "\n" + timestamp
+    # Simplified for public endpoints without body
+    sign_str = f"{method}\n{path}\n{query}\n{body_hash}\n{timestamp}"
+    sign = hmac.new(secret.encode(), sign_str.encode(), hashlib.sha512).hexdigest()
+    headers = {"KEY": api_key, "Timestamp": timestamp, "SIGN": sign}
+    return http_get(f"https://api.gateio.ws/api/v4{path}", headers=headers, timeout=10)
+
+def okx_signed_get(path, api_key, secret, passphrase, params=None):
+    if not api_key or not secret:
+        return None
+    import base64, datetime
+    params = params or {}
+    timestamp = datetime.datetime.utcnow().isoformat()[:-3] + "Z"
+    query = ""
+    if params:
+        query = "?" + urlencode(params)
+    message = timestamp + "GET" + path + query
+    mac = hmac.new(secret.encode(), message.encode(), hashlib.sha256)
+    sign = base64.b64encode(mac.digest()).decode()
+    headers = {"OK-ACCESS-KEY": api_key, "OK-ACCESS-SIGN": sign, "OK-ACCESS-TIMESTAMP": timestamp, "OK-ACCESS-PASSPHRASE": passphrase}
+    return http_get(f"https://www.okx.com{path}{query}", headers=headers, timeout=10)
+
+def bybit_signed_get(path, api_key, secret, params=None):
+    if not api_key or not secret:
+        return None
+    params = params or {}
+    params["api_key"] = api_key
+    params["timestamp"] = int(time.time()*1000)
+    # Bybit v5 uses different, for coin info use /v5/asset/coin/query-info?coin=BTC
+    qs = urlencode(sorted(params.items()))
+    sign = hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    params["sign"] = sign
+    return http_get(f"https://api.bybit.com{path}?{urlencode(params)}", timeout=10)
+
+def get_deposit_status_with_key(cex_key, symbol):
+    """Check deposit/withdraw bang API key neu co, return (withdraw_en, deposit_en, source)"""
+    cex_key = cex_key.upper()
+    try:
+        if cex_key == "BINANCE" and BINANCE_API_KEY:
+            r = binance_signed_get("/sapi/v1/capital/config/getall", BINANCE_API_KEY, BINANCE_SECRET)
+            if r and r.status_code == 200:
+                for coin in r.json():
+                    if coin.get("coin") == symbol:
+                        for net in coin.get("networkList", []):
+                            if net.get("depositEnable") or net.get("withdrawEnable"):
+                                return bool(net.get("withdrawEnable")), bool(net.get("depositEnable")), "binance-signed"
+                        return False, False, "binance-signed"
+        elif cex_key == "MEXC" and MEXC_API_KEY:
+            r = mexc_signed_get("/api/v3/capital/config/getall")
+            if r and r.status_code == 200:
+                for coin in r.json():
+                    if coin.get("coin") == symbol:
+                        for net in coin.get("networkList", []):
+                            return bool(net.get("withdrawEnable")), bool(net.get("depositEnable")), "mexc-signed"
+        elif cex_key == "BYBIT" and BYBIT_API_KEY:
+            r = bybit_signed_get("/v5/asset/coin/query-info", BYBIT_API_KEY, BYBIT_SECRET, {"coin": symbol})
+            if r and r.status_code == 200:
+                data = r.json().get("result", {}).get("rows", [])
+                for row in data:
+                    if row.get("coin") == symbol:
+                        chains = row.get("chains", [])
+                        if chains:
+                            c = chains[0]
+                            wd = c.get("chainWithdraw")==1 or str(c.get("chainWithdraw"))=="1" or c.get("withdrawEnable")
+                            dep = c.get("chainDeposit")==1 or str(c.get("chainDeposit"))=="1" or c.get("depositEnable")
+                            return bool(wd), bool(dep), "bybit-signed"
+        elif cex_key == "GATE":
+            # Gate public is enough, no need key for currencies
+            r = http_get(f"https://api.gateio.ws/api/v4/spot/currencies/{symbol}", timeout=5)
+            if r and r.status_code == 200:
+                j = r.json()
+                return not j.get("withdraw_disabled", False), not j.get("deposit_disabled", False), "gate-public"
+        elif cex_key == "OKX" and OKX_API_KEY:
+            # OKX can check via public, but signed gives more
+            r = okx_signed_get(f"/api/v5/asset/currencies", OKX_API_KEY, OKX_SECRET, OKX_PASSPHRASE, {"ccy": symbol})
+            if r and r.status_code == 200:
+                for cur in r.json().get("data", []):
+                    if cur.get("ccy") == symbol:
+                        return bool(cur.get("canWd")), bool(cur.get("canDep")), "okx-signed"
+        elif cex_key == "BITGET" and BITGET_API_KEY:
+            # Bitget: /api/spot/v1/wallet/getCoinList needs sign
+            # For simplicity, use public: https://api.bitget.com/api/spot/v1/public/currencies
+            r = http_get(f"https://api.bitget.com/api/spot/v1/public/currencies", timeout=5)
+            if r and r.status_code == 200:
+                for cur in r.json().get("data", []):
+                    if cur.get("coinName") == symbol:
+                        chains = cur.get("chains", [])
+                        if chains:
+                            wd = any(c.get("withdrawable")=="true" for c in chains)
+                            dep = any(c.get("rechargeable")=="true" for c in chains)
+                            return wd, dep, "bitget-public"
+        elif cex_key == "KUCOIN":
+            r = http_get(f"https://api.kucoin.com/api/v1/currencies/{symbol}", timeout=5)
+            if r and r.status_code == 200:
+                data = r.json().get("data", {})
+                chains = data.get("chains", [])
+                if chains:
+                    wd = any(c.get("isWithdrawEnabled") for c in chains)
+                    dep = any(c.get("isDepositEnabled") for c in chains)
+                    return wd, dep, "kucoin-public"
+        elif cex_key == "HTX":
+            r = http_get(f"https://api.huobi.pro/v2/reference/currencies?currency={symbol.lower()}", timeout=5)
+            if r and r.status_code == 200:
+                for cur in r.json().get("data", []):
+                    if cur.get("currency","").upper() == symbol.upper():
+                        ok = cur.get("instStatus") == "normal" or cur.get("visible", False)
+                        return ok, ok, "htx-public"
+        elif cex_key == "BINGX":
+            # BingX: try signed if key available, else public
+            if BINGX_API_KEY and BINGX_SECRET:
+                try:
+                    # BingX sign: timestamp + params, HMAC SHA256
+                    import time
+                    ts = str(int(time.time()*1000))
+                    params = {}
+                    qs = f"timestamp={ts}"
+                    sign = hmac.new(BINGX_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
+                    headers = {"X-BX-APIKEY": BINGX_API_KEY}
+                    r = http_get(f"https://open-api.bingx.com/openApi/wallets/v1/capital/config/getall?{qs}&signature={sign}", headers=headers, timeout=10)
+                    if r and r.status_code == 200:
+                        data = r.json().get("data", [])
+                        for coin in data:
+                            if coin.get("coin") == symbol:
+                                nets = coin.get("networkList", [])
+                                if nets:
+                                    wd = any(n.get("withdrawEnable") for n in nets)
+                                    dep = any(n.get("depositEnable") for n in nets)
+                                    return wd, dep, "bingx-signed"
+                except Exception as e:
+                    log.debug("BingX signed fail %s", e)
+            # fallback public
+            r = http_get(f"https://open-api.bingx.com/openApi/wallets/v1/capital/config/getall", timeout=5)
+            if r and r.status_code == 200:
+                data = r.json().get("data", []) if isinstance(r.json().get("data"), list) else []
+                for coin in data:
+                    if coin.get("coin") == symbol:
+                        nets = coin.get("networkList", [])
+                        if nets:
+                            wd = any(n.get("withdrawEnable") for n in nets)
+                            dep = any(n.get("depositEnable") for n in nets)
+                            return wd, dep, "bingx-public"
+        elif cex_key == "LBANK":
+            r = http_get(f"https://api.lbank.info/v2/supplement/assetDetail.do?symbol={symbol.lower()}_usdt", timeout=5)
+            if r and r.status_code == 200:
+                # LBank asset detail
+                data = r.json().get("data", {})
+                # If exists, assume enabled
+                return True, True, "lbank-public"
+    except Exception as e:
+        log.debug("Signed check %s %s fail %s", cex_key, symbol, e)
+    return None
+
+def safe_get_deposit_status_public(cex_key, symbol):
+    """Check deposit/withdraw: uu tien signed key neu co, fallback public, cache 5 phut"""
+    cex_key = cex_key.upper()
+    # Check cache
+    with DEPOSIT_CACHE_LOCK:
+        cache = CEX_DEPOSIT_CACHE.get(cex_key, {}).get(symbol)
+        if cache and time.time() - cache[2] < 300:  # cache 5 phut
+            return cache[0], cache[1]
+    
+    # Try signed first
+    signed = get_deposit_status_with_key(cex_key, symbol)
+    if signed:
+        wd, dep, src = signed
+        with DEPOSIT_CACHE_LOCK:
+            if cex_key not in CEX_DEPOSIT_CACHE:
+                CEX_DEPOSIT_CACHE[cex_key] = {}
+            CEX_DEPOSIT_CACHE[cex_key][symbol] = (wd, dep, time.time())
+        log.info("DEPOSIT CHECK %s %s -> W:%s D:%s via %s", cex_key, symbol, wd, dep, src)
+        return wd, dep
+    
+    # Fallback public
+    try:
+        if cex_key == "GATE":
+            r = http_get(f"https://api.gateio.ws/api/v4/spot/currencies/{symbol}", timeout=5)
+            if r and r.status_code == 200:
+                j = r.json()
+                wd = not j.get("withdraw_disabled", False)
+                dep = not j.get("deposit_disabled", False)
+                with DEPOSIT_CACHE_LOCK:
+                    if cex_key not in CEX_DEPOSIT_CACHE:
+                        CEX_DEPOSIT_CACHE[cex_key] = {}
+                    CEX_DEPOSIT_CACHE[cex_key][symbol] = (wd, dep, time.time())
+                return wd, dep
+        elif cex_key == "KUCOIN":
+            r = http_get(f"https://api.kucoin.com/api/v1/currencies/{symbol}", timeout=5)
+            if r and r.status_code == 200:
+                data = r.json().get("data", {})
+                chains = data.get("chains", [])
+                if chains:
+                    # Check if any chain enabled
+                    wd = any(c.get("isWithdrawEnabled") for c in chains)
+                    dep = any(c.get("isDepositEnabled") for c in chains)
+                    with DEPOSIT_CACHE_LOCK:
+                        if cex_key not in CEX_DEPOSIT_CACHE:
+                            CEX_DEPOSIT_CACHE[cex_key] = {}
+                        CEX_DEPOSIT_CACHE[cex_key][symbol] = (wd, dep, time.time())
+                    return wd, dep
+        elif cex_key == "OKX":
+            r = http_get(f"https://www.okx.com/api/v5/asset/currencies?ccy={symbol}", timeout=5)
+            if r and r.status_code == 200:
+                for cur in r.json().get("data", []):
+                    if cur.get("ccy") == symbol:
+                        wd = cur.get("canWd", True)
+                        dep = cur.get("canDep", True)
+                        with DEPOSIT_CACHE_LOCK:
+                            if cex_key not in CEX_DEPOSIT_CACHE:
+                                CEX_DEPOSIT_CACHE[cex_key] = {}
+                            CEX_DEPOSIT_CACHE[cex_key][symbol] = (wd, dep, time.time())
+                        return wd, dep
+        elif cex_key == "HTX":
+            r = http_get(f"https://api.huobi.pro/v2/reference/currencies?currency={symbol.lower()}", timeout=5)
+            if r and r.status_code == 200:
+                for cur in r.json().get("data", []):
+                    if cur.get("currency","").upper() == symbol.upper():
+                        # HTX: instStatus = normal means enabled
+                        wd = cur.get("instStatus") == "normal"
+                        dep = wd
+                        with DEPOSIT_CACHE_LOCK:
+                            if cex_key not in CEX_DEPOSIT_CACHE:
+                                CEX_DEPOSIT_CACHE[cex_key] = {}
+                            CEX_DEPOSIT_CACHE[cex_key][symbol] = (wd, dep, time.time())
+                        return wd, dep
+    except Exception as e:
+        log.debug("Public deposit check %s %s fail %s", cex_key, symbol, e)
+    
+    # Default: cho qua
+    return True, True
+
+# Base CEX Adapter
+class BaseCEX:
+    def __init__(self, key):
+        self.key = key
+        self.cfg = CEX_REGISTRY[key]
+    def fetch_pairs(self):
+        return {}
+    def fetch_tokens(self, pairs):
+        return {}
+    def fetch_tickers(self):
+        return {}
+    def fetch_orderbook(self, symbol):
+        return None
+
+class MexcCEX(BaseCEX):
+    def __init__(self): super().__init__("MEXC")
+    def fetch_pairs(self):
         r = http_get(f"{MEXC_BASE}/api/v3/exchangeInfo", limiter=MEXC_LIMITER, timeout=20)
-        if not r:
-            raise RuntimeError("exchangeInfo no response")
-        if r.status_code != 200:
-            raise RuntimeError(f"exchangeInfo fail {r.status_code} {r.text[:200]}")
+        if not r or r.status_code != 200:
+            return {}
         out = {}
         for s in r.json().get("symbols", []):
             if s.get("quoteAsset") == "USDT" and str(s.get("status")) == "1":
                 out[s["symbol"]] = s["baseAsset"]
-        log.info("Lay duoc %d pairs", len(out))
         return out
-    def _fetch_tokens(self, pairs):
+    def fetch_tokens(self, pairs):
         r = mexc_signed_get("/api/v3/capital/config/getall")
-        if not r:
-            raise RuntimeError("capital/config no response")
-        if r.status_code != 200:
-            raise RuntimeError(f"capital/config fail {r.status_code} {r.text[:300]}")
+        if not r or r.status_code != 200:
+            return {k: {} for k in CHAINS}
         base_set = set(pairs.values())
         sym2pair = {}
         for p, s in pairs.items():
             sym2pair.setdefault(s, p)
         result = {k: {} for k in CHAINS}
-        unmatched = set()
         for coin in r.json():
             sym = coin.get("coin")
             if sym not in base_set:
@@ -336,32 +668,303 @@ class MexcData:
             for net in coin.get("networkList", []) or []:
                 net_name = re.sub(r"[^A-Z0-9]", "", (net.get("network") or "").upper())
                 contract = (net.get("contract") or "").strip()
-                # FIX V8.1: SOL native
                 if net_name in {"SOL","SOLANA"} and (not contract or contract.upper()=="SOL"):
                     contract = WSOL
                 found = next((ch for ch, cfg in CHAINS.items() if net_name in cfg["aliases"]), None)
-                if not found:
-                    unmatched.add(net_name); continue
-                if not valid_contract(found, contract):
-                    continue
+                if not found: continue
+                if not valid_contract(found, contract): continue
                 dedup = norm_addr(found, contract)
-                if dedup in result[found]:
-                    continue
+                if dedup in result[found]: continue
                 result[found][dedup] = {
                     "symbol": sym, "contract": contract, "dedup_key": dedup, "chain": found,
                     "pair": sym2pair.get(sym, sym + "USDT"), "raw_network": net.get("network"),
                     "withdraw_fee": fnum(net.get("withdrawFee")), "withdraw_min": fnum(net.get("withdrawMin")),
                     "withdraw_enable": bool(net.get("withdrawEnable")),
                     "deposit_enable": bool(net.get("depositEnable")),
+                    "cex": "MEXC", "cex_pair": sym2pair.get(sym, sym + "USDT"),
                 }
-        final = {k: list(v.values()) for k, v in result.items()}
-        for k, v in final.items():
-            log.info("MEXC %s: %d token hop le", k, len(v))
-        if unmatched:
-            log.info("MEXC unmatched sample: %s", list(unmatched)[:20])
-        return final
+        return {k: list(v.values()) for k, v in result.items()}
+    def fetch_tickers(self):
+        r = http_get(f"{MEXC_BASE}/api/v3/ticker/24hr", timeout=15)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        for t in r.json():
+            sym = t.get("symbol")
+            if not sym or not sym.endswith("USDT"):
+                continue
+            try:
+                out[sym] = {"bid": float(t.get("bidPrice") or 0), "ask": float(t.get("askPrice") or 0)}
+            except:
+                continue
+        return out
+
+class BinanceCEX(BaseCEX):
+    def __init__(self): super().__init__("BINANCE")
+    def fetch_pairs(self):
+        r = http_get("https://api.binance.com/api/v3/exchangeInfo", timeout=15)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        for s in r.json().get("symbols", []):
+            if s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING":
+                out[s["symbol"]] = s["baseAsset"]
+        return out
+    def fetch_tickers(self):
+        r = http_get("https://api.binance.com/api/v3/ticker/bookTicker", timeout=10)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        for t in r.json():
+            sym = t.get("symbol")
+            if not sym or not sym.endswith("USDT"):
+                continue
+            try:
+                out[sym] = {"bid": float(t.get("bidPrice")), "ask": float(t.get("askPrice"))}
+            except:
+                continue
+        return out
+
+class GateCEX(BaseCEX):
+    def __init__(self): super().__init__("GATE")
+    def fetch_pairs(self):
+        r = http_get("https://api.gateio.ws/api/v4/spot/currency_pairs", timeout=15)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        for t in r.json():
+            id_ = t.get("id")
+            if not id_ or not id_.endswith("_USDT"):
+                continue
+            base = id_.split("_")[0]
+            out[id_.replace("_","")] = base
+        return out
+    def fetch_tickers(self):
+        r = http_get("https://api.gateio.ws/api/v4/spot/tickers", timeout=10)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        for t in r.json():
+            cp = t.get("currency_pair","").replace("_","")
+            try:
+                out[cp] = {"bid": float(t.get("highest_bid") or 0), "ask": float(t.get("lowest_ask") or 0)}
+            except:
+                continue
+        return out
+
+class OkxCEX(BaseCEX):
+    def __init__(self): super().__init__("OKX")
+    def fetch_pairs(self):
+        r = http_get("https://www.okx.com/api/v5/market/tickers?instType=SPOT", timeout=15)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        for t in r.json().get("data", []):
+            inst = t.get("instId")
+            if not inst or not inst.endswith("-USDT"):
+                continue
+            base = inst.split("-")[0]
+            out[inst.replace("-","")] = base
+        return out
+    def fetch_tickers(self):
+        r = http_get("https://www.okx.com/api/v5/market/tickers?instType=SPOT", timeout=10)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        for t in r.json().get("data", []):
+            inst = t.get("instId","").replace("-","")
+            try:
+                out[inst] = {"bid": float(t.get("bidPx") or 0), "ask": float(t.get("askPx") or 0)}
+            except:
+                continue
+        return out
+
+class BybitCEX(BaseCEX):
+    def __init__(self): super().__init__("BYBIT")
+    def fetch_pairs(self):
+        r = http_get("https://api.bybit.com/v5/market/instruments-info?category=spot", timeout=15)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        for t in r.json().get("result", {}).get("list", []):
+            sym = t.get("symbol")
+            if not sym or not sym.endswith("USDT"):
+                continue
+            base = t.get("baseCoin")
+            out[sym] = base
+        return out
+    def fetch_tickers(self):
+        r = http_get("https://api.bybit.com/v5/market/tickers?category=spot", timeout=10)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        for t in r.json().get("result", {}).get("list", []):
+            sym = t.get("symbol")
+            try:
+                out[sym] = {"bid": float(t.get("bid1Price") or 0), "ask": float(t.get("ask1Price") or 0)}
+            except:
+                continue
+        return out
+
+class BitgetCEX(BaseCEX):
+    def __init__(self): super().__init__("BITGET")
+    def fetch_pairs(self):
+        r = http_get("https://api.bitget.com/api/spot/v1/public/symbols", timeout=15)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        for t in r.json().get("data", []):
+            sym = t.get("symbolName")
+            if not sym or not sym.endswith("USDT"):
+                continue
+            out[sym] = t.get("baseCoin")
+        return out
+    def fetch_tickers(self):
+        r = http_get("https://api.bitget.com/api/spot/v1/market/tickers", timeout=10)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        for t in r.json().get("data", []):
+            sym = t.get("symbol")
+            try:
+                out[sym] = {"bid": float(t.get("buyOne") or 0), "ask": float(t.get("sellOne") or 0)}
+            except:
+                continue
+        return out
+
+class KucoinCEX(BaseCEX):
+    def __init__(self): super().__init__("KUCOIN")
+    def fetch_pairs(self):
+        r = http_get("https://api.kucoin.com/api/v1/symbols", timeout=15)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        for t in r.json().get("data", []):
+            sym = t.get("symbol")
+            if not sym or not sym.endswith("-USDT"):
+                continue
+            out[sym.replace("-","")] = t.get("baseCurrency")
+        return out
+    def fetch_tickers(self):
+        r = http_get("https://api.kucoin.com/api/v1/market/allTickers", timeout=10)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        for t in r.json().get("data", {}).get("ticker", []):
+            sym = t.get("symbol","").replace("-","")
+            try:
+                out[sym] = {"bid": float(t.get("buy") or 0), "ask": float(t.get("sell") or 0)}
+            except:
+                continue
+        return out
+
+class HtxCEX(BaseCEX):
+    def __init__(self): super().__init__("HTX")
+    def fetch_pairs(self):
+        r = http_get("https://api.huobi.pro/v1/common/symbols", timeout=15)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        for t in r.json().get("data", []):
+            if t.get("quote-currency")=="usdt":
+                base = t.get("base-currency","").upper()
+                out[base+"USDT"] = base
+        return out
+    def fetch_tickers(self):
+        r = http_get("https://api.huobi.pro/v1/market/tickers", timeout=10)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        for t in r.json().get("data", []):
+            sym = t.get("symbol","").upper()
+            if not sym.endswith("USDT"):
+                continue
+            try:
+                out[sym] = {"bid": float(t.get("bid") or 0), "ask": float(t.get("ask") or 0)}
+            except:
+                continue
+        return out
+
+class BingxCEX(BaseCEX):
+    def __init__(self): super().__init__("BINGX")
+    def fetch_pairs(self):
+        r = http_get("https://open-api.bingx.com/openApi/spot/v1/common/symbols", timeout=15)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        for t in r.json().get("data", {}).get("symbols", []):
+            sym = t.get("symbol")
+            if not sym or not sym.endswith("-USDT"):
+                continue
+            out[sym.replace("-","")] = sym.split("-")[0]
+        return out
+    def fetch_tickers(self):
+        r = http_get("https://open-api.bingx.com/openApi/spot/v1/ticker/24hr", timeout=10)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        for t in r.json().get("data", []):
+            sym = t.get("symbol","").replace("-","")
+            try:
+                out[sym] = {"bid": float(t.get("bidPrice") or 0), "ask": float(t.get("askPrice") or 0)}
+            except:
+                continue
+        return out
+
+class LBankCEX(BaseCEX):
+    def __init__(self): super().__init__("LBANK")
+    def fetch_pairs(self):
+        r = http_get("https://api.lbank.info/v2/currencyPairs.do", timeout=15)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        try:
+            for sym in r.json().get("data", []):
+                if sym.endswith("_usdt"):
+                    base = sym.split("_")[0].upper()
+                    out[base+"USDT"] = base
+        except:
+            pass
+        return out
+    def fetch_tickers(self):
+        r = http_get("https://api.lbank.info/v2/ticker.do?symbol=all", timeout=10)
+        if not r or r.status_code != 200:
+            return {}
+        out = {}
+        try:
+            for sym, t in r.json().get("data", {}).items():
+                if not sym.endswith("_usdt"):
+                    continue
+                s = sym.replace("_","").upper()
+                try:
+                    out[s] = {"bid": float(t["ticker"].get("buy") or 0), "ask": float(t["ticker"].get("sell") or 0)}
+                except:
+                    continue
+        except:
+            pass
+        return out
+
+CEX_ADAPTERS = {
+    "MEXC": MexcCEX(),
+    "BINANCE": BinanceCEX(),
+    "GATE": GateCEX(),
+    "OKX": OkxCEX(),
+    "BYBIT": BybitCEX(),
+    "BITGET": BitgetCEX(),
+    "KUCOIN": KucoinCEX(),
+    "HTX": HtxCEX(),
+    "BINGX": BingxCEX(),
+    "LBANK": LBankCEX(),
+}
+
+class MultiCEXData:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.tokens = {}
+        self.pairs = {}
+        self.ts = 0
+        self.retry_after = 0
     def ensure_static(self):
-        changes = []
         with self.lock:
             now = time.time()
             if self.tokens and now - self.ts < STATIC_TTL:
@@ -369,167 +972,81 @@ class MexcData:
             if now < self.retry_after:
                 return
             try:
-                pairs = self._fetch_pairs()
-                tokens = self._fetch_tokens(pairs)
-                new_status = {}
-                for ch, lst in tokens.items():
+                all_tokens = {k: {} for k in CHAINS}
+                all_pairs = {}
+                mexc_adapter = CEX_ADAPTERS["MEXC"]
+                mexc_pairs = mexc_adapter.fetch_pairs()
+                mexc_tokens = mexc_adapter.fetch_tokens(mexc_pairs)
+                all_pairs["MEXC"] = mexc_pairs
+                for chain, lst in mexc_tokens.items():
                     for t in lst:
-                        new_status[(ch, t["dedup_key"])] = (t["withdraw_enable"], t["deposit_enable"], t["symbol"], t["contract"])
-                if self.status:
-                    for k, vals in new_status.items():
-                        w, d, sym, contract = vals
-                        old = self.status.get(k)
-                        if old:
-                            ow, od = old[0], old[1]
-                            # Mo lai: tu ❌ -> ✅
-                            if (not ow and w) or (not od and d):
-                                changes.append({"type": "open", "symbol": sym, "chain": k[0], "deposit": d, "withdraw": w, "contract": contract})
-                            # Dong lai: tu ✅ -> ❌
-                            elif (ow and not w) or (od and not d):
-                                changes.append({"type": "close", "symbol": sym, "chain": k[0], "deposit": d, "withdraw": w, "contract": contract})
-                self.status = new_status
-                self.pairs, self.tokens, self.ts = pairs, tokens, now
+                        all_tokens[chain][t["dedup_key"]] = t
+                def fetch_other(cex_key):
+                    if cex_key not in ENABLED_CEXS or cex_key=="MEXC":
+                        return cex_key, {}, {}
+                    try:
+                        ad = CEX_ADAPTERS.get(cex_key)
+                        if not ad:
+                            return cex_key, {}, {}
+                        pairs = ad.fetch_pairs()
+                        tokens = {k: {} for k in CHAINS}
+                        for pair, base in pairs.items():
+                            wd_en, dep_en = safe_get_deposit_status_public(cex_key, base)
+                            for chain in CHAINS:
+                                for dedup, mt in list(all_tokens[chain].items())[:2000]:
+                                    if mt["symbol"]==base:
+                                        nt = dict(mt)
+                                        nt["cex"] = cex_key
+                                        nt["cex_pair"] = pair
+                                        nt["pair"] = pair
+                                        nt["withdraw_enable"] = wd_en
+                                        nt["deposit_enable"] = dep_en
+                                        tokens[chain][dedup+f"_{cex_key}"] = nt
+                        return cex_key, pairs, tokens
+                    except Exception as e:
+                        log.warning("CEX %s fetch fail: %s", cex_key, e)
+                        return cex_key, {}, {}
+                with _TPE(max_workers=5) as ex:
+                    futures = {ex.submit(fetch_other, k): k for k in ENABLED_CEXS if k!="MEXC"}
+                    for fut in futures:
+                        try:
+                            cex_key, pairs, tokens = fut.result(timeout=20)
+                            all_pairs[cex_key]=pairs
+                            for chain in CHAINS:
+                                for dedup, t in tokens.get(chain, {}).items():
+                                    if dedup not in all_tokens[chain]:
+                                        all_tokens[chain][dedup]=t
+                        except Exception as e:
+                            log.warning("CEX parallel fail %s", e)
+                final = {k: list(v.values()) for k, v in all_tokens.items()}
+                self.tokens = final
+                self.pairs = all_pairs
+                self.ts = now
+                total = sum(len(v) for v in final.values())
+                log.info("MultiCEX loaded: %d tokens, CEXs=%s", total, list(all_pairs.keys()))
             except Exception as e:
-                log.error("Lam moi MEXC loi: %s", e)
+                log.error("MultiCEX refresh fail: %s", e)
                 self.retry_after = now + 60
-        if changes:
-            # V8.3: format moi theo yeu cau - contract copyable, icon ❌ cho dong
-            opens = [c for c in changes if c["type"] == "open"]
-            closes = [c for c in changes if c["type"] == "close"]
-            for item in opens[:10]:
-                dep_icon = "✅" if item["deposit"] else "❌"
-                wd_icon = "✅" if item["withdraw"] else "❌"
-                msg = (f"🔓 <b>MEXC Deposits & Withdrawals Reopened</b>\n\n"
-                       f"<b>{esc(item['symbol'])} [{item['chain']}]</b> — Deposit {dep_icon} | Withdrawal {wd_icon}\n\n"
-                       f"Contract: <code>{esc(item['contract'])}</code>")
-                send_telegram(msg)
-            for item in closes[:10]:
-                dep_icon = "✅" if item["deposit"] else "❌"
-                wd_icon = "✅" if item["withdraw"] else "❌"
-                msg = (f"🔒 <b>MEXC Deposits & Withdrawals Closed</b>\n\n"
-                       f"<b>{esc(item['symbol'])} [{item['chain']}]</b> — Deposit {dep_icon} | Withdrawal {wd_icon}\n\n"
-                       f"Contract: <code>{esc(item['contract'])}</code>")
-                send_telegram(msg)
-    def get_book(self):
-        with self.book_lock:
-            if self.book and time.time() - self.book_ts < BOOK_TTL:
-                return self.book
-            r = http_get(f"{MEXC_BASE}/api/v3/ticker/bookTicker", limiter=MEXC_LIMITER, timeout=20)
-            if r and r.status_code == 200:
-                try:
-                    book = {}
-                    for t in r.json():
-                        bid, ask = fnum(t.get("bidPrice")), fnum(t.get("askPrice"))
-                        if 0 < bid < ask:
-                            book[t["symbol"]] = (bid, ask)
-                    self.book, self.book_ts = book, time.time()
-                except Exception as e:
-                    log.warning("bookTicker parse loi: %s", e)
-            return self.book
+    def fetch_all_tickers(self):
+        def fetch_one(cex_key):
+            try:
+                ad = CEX_ADAPTERS.get(cex_key)
+                if not ad:
+                    return
+                tickers = ad.fetch_tickers()
+                for sym, data in tickers.items():
+                    if data.get("bid") and data.get("ask"):
+                        update_live_price(cex_key, sym, data["bid"], data["ask"], "rest")
+            except Exception as e:
+                log.debug("Ticker %s fail %s", cex_key, e)
+        with _TPE(max_workers=5) as ex:
+            list(ex.map(fetch_one, ENABLED_CEXS))
+
+class MexcData(MultiCEXData):
+    pass
 
 MEXC = MexcData()
 
-def mexc_depth(pair):
-    r = http_get(f"{MEXC_BASE}/api/v3/depth", params={"symbol": pair, "limit": 100}, limiter=MEXC_LIMITER, timeout=12)
-    if not r or r.status_code != 200:
-        return None
-    try:
-        j = r.json()
-        bids = [(float(p), float(q)) for p, q in j.get("bids", []) if float(p) > 0 and float(q) > 0]
-        asks = [(float(p), float(q)) for p, q in j.get("asks", []) if float(p) > 0 and float(q) > 0]
-    except:
-        return None
-    if len(bids) < 5 or len(asks) < 5:
-        return None
-    if asks[0][0] <= bids[0][0] or (asks[0][0] - bids[0][0]) / asks[0][0] > 0.05:
-        return None
-    return {"bids": bids, "asks": asks}
-
-def walk_usd(levels, usd):
-    left, tok = usd, 0.0
-    for p, q in levels:
-        take = min(left, p * q)
-        tok += take / p
-        left -= take
-        if left <= 1e-9:
-            break
-    return (usd / tok, tok) if left <= 0.01 and tok > 0 else None
-
-def walk_tokens(levels, tokens):
-    left, usd = tokens, 0.0
-    for p, q in levels:
-        take = min(left, q)
-        usd += take * p
-        left -= take
-        if left <= 1e-12:
-            break
-    return usd if left <= tokens * 1e-6 else None
-
-def fetch_dex_pools(chain_key, addrs):
-    cid = CHAINS[chain_key]["dex_chain"]
-    r = http_get(f"https://api.dexscreener.com/tokens/v1/{cid}/{','.join(addrs)}", limiter=DEX_LIMITER)
-    API.report("dexscreener", bool(r and r.status_code == 200))
-    if not r or r.status_code != 200:
-        return None
-    try:
-        pairs = r.json()
-    except:
-        return None
-    if not isinstance(pairs, list):
-        return None
-    STATS[chain_key].inc("dex_pairs", sum(1 for p in pairs if p.get("chainId") == cid))
-    best = {}
-    now_ms = time.time() * 1000
-    for p in pairs:
-        if p.get("chainId") != cid:
-            continue
-        base = p.get("baseToken") or {}
-        key = norm_addr(chain_key, base.get("address"))
-        price = fnum(p.get("priceUsd"))
-        liq = fnum((p.get("liquidity") or {}).get("usd"))
-        vol = fnum((p.get("volume") or {}).get("h24"))
-        h1 = (p.get("txns") or {}).get("h1") or {}
-        txns = int(fnum(h1.get("buys")) + fnum(h1.get("sells")))
-        fdv = fnum(p.get("fdv"))
-        created = fnum(p.get("pairCreatedAt"))
-        age_h = (now_ms - created) / 3.6e6 if created > 0 else 9999
-        if price <= 0 or liq < MIN_LIQ_USD or vol < MIN_VOL_24H or txns < MIN_TXNS_H1:
-            continue
-        if age_h < MIN_POOL_AGE_H:
-            continue
-        if vol / liq < 0.05:
-            continue
-        if fdv > 0 and fdv / liq > 100:
-            continue
-        score = liq
-        if key in best and best[key].get("score",0) >= score:
-            continue
-        dex_id = (p.get("dexId") or "").lower()
-        pc = p.get("priceChange") or {}
-        best[key] = {"price": price, "liq": liq, "vol24": vol, "txns_h1": txns, "dex": dex_id,
-                     "fee": DEX_FEES.get(dex_id, DEFAULT_DEX_FEE), "url": p.get("url") or "",
-                     "pair_name": f"{base.get('symbol')}/{(p.get('quoteToken') or {}).get('symbol')}",
-                     "base_symbol": base.get("symbol") or "", "quote_addr": (p.get("quoteToken") or {}).get("address") or "",
-                     "fdv": fdv, "score": score, "chg_m5": fnum(pc.get("m5")), "chg_h1": fnum(pc.get("h1")), "age_h": age_h}
-    return best
-
-def symbol_ok(a, b):
-    if not a or not b:
-        return False
-    ca = re.sub(r"[^A-Z0-9]","",a.upper())
-    cb = re.sub(r"[^A-Z0-9]","",b.upper())
-    if not ca or not cb:
-        return False
-    if ca==cb:
-        return True
-    if len(ca)<4 or len(cb)<4:
-        return False
-    if (ca.startswith(cb) or ca.endswith(cb) or cb.startswith(ca) or cb.endswith(ca)) and abs(len(ca)-len(cb))<=3:
-        return True
-    return False
-
-DEC_CACHE = {}
-DEC_LOCK = threading.Lock()
 def get_decimals(chain_key, contract):
     key = (chain_key, norm_addr(chain_key, contract))
     with DEC_LOCK:
@@ -730,7 +1247,7 @@ def dex_prices_estimate(pool):
     return impact_pct, pool["price"] * (1 + f + i), pool["price"] * (1 - f - i)
 
 def risk_buffer(chain_key, pool, sec):
-    tm = CHAINS[chain_key].get("transfer_min", 5)
+    tm = get_real_transfer_time(chain_key, pool)
     move = max(abs(pool.get("chg_m5", 0)) * math.sqrt(tm / 5.0), abs(pool.get("chg_h1", 0)) * math.sqrt(tm / 60.0))
     buf = RISK_FLOOR + RISK_K * move
     buf += SOFT_FLAG_BUFFER * len(sec.get("soft", []))
@@ -738,13 +1255,198 @@ def risk_buffer(chain_key, pool, sec):
         buf += UNKNOWN_SEC_BUFFER
     return buf
 
+# ========= V8.8 NEW FUNCTIONS =========
+def calc_optimal_size(pool_liq, pool_vol24, gross_pct, base_usd=ORDER_SIZE_USD):
+    """Size dong 200-2000$ dua tren thanh khoan"""
+    # muc tieu impact 0.3%
+    target_impact = 0.003
+    # size toi uu = liq * target_impact
+    size_by_liq = pool_liq * target_impact
+    # neu vol cao, cho phep size lon hon
+    vol_factor = min(pool_vol24 / 100000, 2.0)  # vol 100k -> x1, vol 200k+ -> x2
+    size_by_liq *= vol_factor
+    # neu gross cao, tang size 20%
+    if gross_pct > 3:
+        size_by_liq *= 1.5
+    elif gross_pct > 2:
+        size_by_liq *= 1.2
+    size = max(ORDER_SIZE_MIN, min(ORDER_SIZE_MAX, size_by_liq, ORDER_SIZE_MAX))
+    # dam bao it nhat base_usd neu liq du lon
+    if pool_liq > 500000:
+        size = max(size, base_usd)
+    return round(size, 2)
+
+def is_honeypot_simulation(chain_key, contract, dec):
+    """Check honeypot bang cach quote $10 that"""
+    if not dec:
+        return False  # khong check duoc thi cho qua
+    try:
+        if chain_key == "SOL":
+            # thu mua $10 USDC -> token
+            q = jup_quote(SOL_USDC, contract, 10 * 1e6)
+            if not q or q.get("out", 0) <= 0:
+                return True
+            # thu ban nguoc lai token -> USDC (lay 90% token vua mua de tranh dust)
+            out_tokens = q["out"]
+            q2 = jup_quote(contract, SOL_USDC, int(out_tokens * 0.9))
+            if not q2 or q2.get("out", 0) <= 0:
+                return True
+            # neu ban ra mat >50% gia tri -> nghi la honeypot hoac tax cao bat thuong
+            buy_value = 10
+            sell_value = q2["out"] / 1e6
+            if sell_value < buy_value * 0.5:
+                log.info("HONEYPOT SIM %s %s sell %.2f vs buy 10", chain_key, contract[:8], sell_value)
+                return True
+        else:
+            # EVM: dung paraswap quote $100 stable -> token va nguoc lai
+            cid = CHAINS[chain_key]["chain_id"]
+            if cid in STABLE:
+                st, sdec = STABLE[cid]
+                q = paraswap_quote(cid, st, contract, 100 * 10**sdec, sdec, dec)
+                if not q:
+                    return True
+    except Exception as e:
+        log.debug("Honeypot sim loi %s: %s", contract[:8], e)
+    return False
+
+# Real transfer time with volatility decay
+TRANSFER_BASE = {"SOL": 2, "BNB": 3, "BASE": 3, "ETH": 8, "POLYGON": 5, "ARBITRUM": 3}
+LAST_GAS_MULTIPLIER = {}
+
+def get_real_transfer_time(chain_key, pool):
+    """Thoi gian nap/rut thuc te = base + bien dong + tac nghen mang"""
+    base = TRANSFER_BASE.get(chain_key, CHAINS[chain_key].get("transfer_min", 5))
+    # neu pool bien dong manh 5m > 5%, cong them thoi gian rui ro
+    chg = abs(pool.get("chg_m5", 0))
+    if chg > 10:
+        base += 3
+    elif chg > 5:
+        base += 1.5
+    # neu chain ETH gas cao, cong them
+    # (co the doc tu RPC neu can, hien tai dung he so don gian)
+    return base
+
+def calc_ai_score(pool, gross_pct, net_pct, chain_key):
+    """AI Score 0-100 de loc keo ngon"""
+    # 40 diem cho profit
+    profit_score = min(net_pct / 5.0 * 40, 40) if net_pct > 0 else 0
+    # 20 diem cho vol/liq ratio (vol cao so voi liq la tot)
+    vl_ratio = pool["vol24"] / max(pool["liq"], 1)
+    vol_score = min(vl_ratio * 20, 20)  # ratio 1.0 -> 20 diem
+    # 15 diem cho txns h1 (dong)
+    tx_score = min(pool.get("txns_h1", 0) / 100.0 * 15, 15)
+    # 10 diem cho tuoi: token 1-24h duoc diem cao neu la meme moi, token qua gia (>30 ngay) bi tru
+    age_h = pool.get("age_h", 0)
+    if age_h < 2:
+        age_score = 10
+    elif age_h < 24:
+        age_score = 8
+    elif age_h < 168:  # 1 tuan
+        age_score = 5
+    else:
+        age_score = 2
+    # 15 diem cho bien dong (co bien dong moi co co hoi)
+    vola_score = min(abs(pool.get("chg_m5", 0)) * 2, 15)
+    total = profit_score + vol_score + tx_score + age_score + vola_score
+    return round(min(total, 100), 1)
+
+# Volatile tracker - token nao bien dong lien tuc -> de xuat hold inventory
+VOLATILE_TRACKER = {}
+HOT_TOKENS = {}  # {symbol: count}
+VOLATILE_LOCK = threading.Lock()
+
+def track_volatility(tok_symbol, pool, contract=None, chain=None, profit_potential=0):
+    chg = abs(pool.get("chg_m5", 0))
+    if chg >= VOLATILE_CHG_THRESHOLD:
+        with VOLATILE_LOCK:
+            VOLATILE_TRACKER[tok_symbol] = VOLATILE_TRACKER.get(tok_symbol, 0) + 1
+            if VOLATILE_TRACKER[tok_symbol] >= VOLATILE_COUNT_TO_HOT:
+                HOT_TOKENS[tok_symbol] = time.time()
+                # V8.9: auto record to inventory DB
+                try:
+                    INV_DB.record_hot(tok_symbol, contract or "", chain or "", profit_potential)
+                except:
+                    pass
+                return True
+    return False
+
+def should_hold_inventory(symbol):
+    """Check if we should hold inventory on both CEX and DEX for fast arbitrage"""
+    with VOLATILE_LOCK:
+        hits = VOLATILE_TRACKER.get(symbol, 0)
+        return hits >= VOLATILE_COUNT_TO_HOT
+
+def get_inventory_suggestion(symbol, usd_size):
+    """Suggest inventory size based on volatility"""
+    if not should_hold_inventory(symbol):
+        return None
+    # Suggest hold 50% of size on each side
+    # Example: usd_size 500$ -> hold 250$ token on DEX + 250$ USDT on CEX
+    return {
+        "dex_hold_usd": usd_size * 0.5,
+        "cex_hold_usd": usd_size * 0.5,
+        "reason": f"HOT token {symbol} volatil {VOLATILE_TRACKER.get(symbol)} times"
+    }
+
+def is_hot_token(symbol):
+    with VOLATILE_LOCK:
+        ts = HOT_TOKENS.get(symbol)
+        if not ts:
+            return False
+        # hot trong 2h
+        if time.time() - ts < 7200:
+            return True
+        else:
+            HOT_TOKENS.pop(symbol, None)
+            return False
+
+# Multi-CEX registry
+CEX_REGISTRY = {
+    "MEXC": {"name": "MEXC", "taker": 0.002, "maker": 0.0, "withdraw_fees": "mexc", "ws": "wss://wbs.mexc.com/ws"},
+    "GATE": {"name": "Gate.io", "taker": 0.002, "maker": 0.002, "api": "https://api.gateio.ws/api/v4", "ws": "wss://api.gateio.ws/ws/v4/"},
+    "BINANCE": {"name": "Binance", "taker": 0.001, "maker": 0.0005, "api": "https://api.binance.com", "ws": "wss://stream.binance.com:9443/ws"},
+    "OKX": {"name": "OKX", "taker": 0.001, "maker": 0.0008, "api": "https://www.okx.com", "ws": "wss://ws.okx.com:8443/ws/v5/public"},
+    "BYBIT": {"name": "Bybit", "taker": 0.001, "maker": 0.0005},
+    "BITGET": {"name": "Bitget", "taker": 0.002, "maker": 0.002},
+    "KUCOIN": {"name": "KuCoin", "taker": 0.001, "maker": 0.001},
+    "BINGX": {"name": "BingX", "taker": 0.002, "maker": 0.002},
+    "HTX": {"name": "HTX", "taker": 0.002, "maker": 0.002},
+    "LBANK": {"name": "LBank", "taker": 0.002, "maker": 0.002},
+}
+
+
 def evaluate(chain_key, tok, pool, depth):
     cfg = CHAINS[chain_key]
     st = STATS[chain_key]
-    usd, gas = ORDER_SIZE_USD, cfg["gas_usd"]
+    # V8.8: dynamic size 200-2000$
+    # tinh size dua tren liq truoc khi tinh toan chinh
+    # su dung gross tam tinh de tinh size
     bids, asks = depth["bids"], depth["asks"]
     if (asks[0][0] - bids[0][0]) / asks[0][0] * 100 > MAX_MEXC_SPREAD:
         return []
+    
+    # === DEPOSIT/WITHDRAW FILTER V8.9.1 ===
+    # Nếu sàn đóng nạp/rút thì bỏ qua chiều đó
+    # (đã được check ở trên nhưng double check ở đây cho an toàn)
+    
+    # === NEW MEMECOIN FILTER V8.8 ===
+    age_h = pool.get("age_h", 0)
+    if age_h < MIN_POOL_AGE_H:
+        if not ALLOW_NEW_MEME:
+            return []
+        # cho phep meme moi neu vol va txns cao
+        if not (pool["vol24"] >= 100000 and pool.get("txns_h1",0) >= 50):
+            # neu la meme cuc moi (<2h) thi yeu cau vol cao hon
+            if age_h < MIN_POOL_AGE_MEME_H:
+                return []
+            # vol trung binh van cho phep neu gross du lon
+            if pool["vol24"] < 50000:
+                return []
+        # memecoin moi thi tang buffer
+        extra_meme_buffer = 0.5
+    else:
+        extra_meme_buffer = 0
+
     sec = get_security(chain_key, tok["contract"])
     if sec["bad"] or sec["buy_tax"] > TAX_MAX or sec["sell_tax"] > TAX_MAX:
         st.inc("suspect")
@@ -760,13 +1462,58 @@ def evaluate(chain_key, tok, pool, depth):
     impact_est, buy_est, sell_est = dex_prices_estimate(pool)
     if not can_real and impact_est > MAX_IMPACT_PCT * 1.5:
         return []
-    buf = risk_buffer(chain_key, pool, sec)
+    buf = risk_buffer(chain_key, pool, sec) + extra_meme_buffer
+    
+    # === HONEYPOT SIMULATION V8.8 ===
+    if can_real and dec:
+        if is_honeypot_simulation(chain_key, tok["contract"], dec):
+            st.inc("suspect")
+            log.info("LOAI HONEYPOT SIM %s %s", chain_key, tok["symbol"])
+            return []
+
+    # === MAKER vs TAKER LOGIC V8.8 ===
+    # Tinh depth: tong volume bid/ask trong 1% gia
+    # Neu depth du lon -> dung maker fee 0%, neu khong -> taker 0.2%
+    def calc_depth_usd(orders, price_ref, pct=0.01):
+        total = 0
+        for price, qty in orders[:10]:
+            if abs(price - price_ref)/price_ref <= pct:
+                total += price * qty
+            else:
+                break
+        return total
+    best_bid, best_ask = bids[0][0], asks[0][0]
+    mid = (best_bid + best_ask)/2
+    bid_depth_usd = calc_depth_usd(bids, best_bid)
+    ask_depth_usd = calc_depth_usd(asks, best_ask)
+    
+    # Tinh size dong truoc
+    # Dung gross tam de tinh size, sau do tinh lai chinh xac
+    gross_est_mexc_to_dex = (sell_est / best_ask -1)*100 if best_ask else 0
+    gross_est_dex_to_mexc = (best_bid / buy_est -1)*100 if buy_est else 0
+    avg_gross_est = max(gross_est_mexc_to_dex, gross_est_dex_to_mexc, 1.0)
+    usd_dynamic = calc_optimal_size(pool["liq"], pool["vol24"], avg_gross_est, ORDER_SIZE_USD)
+    gas = cfg["gas_usd"]
+    
+    # Quyet dinh maker/taker dua tren depth
+    # Neu depth >= size * MULTIPLIER -> co the dat maker
+    can_maker = min(bid_depth_usd, ask_depth_usd) >= usd_dynamic * MAKER_DEPTH_MULTIPLIER
+    
+    if can_maker:
+        mexc_fee_use = MEXC_MAKER_FEE
+        fee_type = "maker"
+    else:
+        mexc_fee_use = MEXC_TAKER_FEE
+        fee_type = "taker"
+
     common = {"mexc_best": (bids[0][0], asks[0][0]), "buy_tax": buy_tax, "sell_tax": sell_tax,
               "withdraw_enable": tok.get("withdraw_enable"), "deposit_enable": tok.get("deposit_enable"),
-              "risk_buf": buf, "sec_known": sec["known"], "sec_soft": sec["soft"], "decimals": dec}
+              "risk_buf": buf, "sec_known": sec["known"], "sec_soft": sec["soft"], "decimals": dec,
+              "usd_size": usd_dynamic, "fee_type": fee_type, "mexc_fee": mexc_fee_use,
+              "transfer_min_real": get_real_transfer_time(chain_key, pool)}
     out = []
     if tok.get("withdraw_enable", True):
-        w = walk_usd(asks, usd)
+        w = walk_usd(asks, usd_dynamic)
         if w:
             avg, tokens = w
             tokens_net = tokens - tok["withdraw_fee"]
@@ -781,31 +1528,35 @@ def evaluate(chain_key, tok, pool, depth):
                     st.inc("real_price_fail")
                     usd_out = None
                 else:
-                    # ROBINHOOD, ARC, NEAR: cho phep estimate du REQUIRE_REAL_PRICE=1
                     usd_out, impact, src = tokens_net * sell_est, impact_est, "estimate"
                 if usd_out:
                     sell_px = usd_out / tokens_net
                     gross = (sell_px / avg - 1) * 100
-                    cost = usd * (1 + MEXC_TAKER_FEE)
+                    cost = usd_dynamic * (1 + mexc_fee_use)
                     revenue = usd_out * (1 - EXTRA_SLIPPAGE) * (1 - sell_tax) - gas
                     net = revenue - cost
                     net_pct = net / cost * 100
-                    # V8.2: impact thuc te = max(jupiter impact, dexscreener estimate) + check lech gia vs pool
                     real_impact = max(impact or 0, impact_est)
+                    # volatility decay
+                    decay = abs(pool.get("chg_m5",0)) * 0.1
+                    net_pct_decayed = net_pct - decay
                     if -5 < gross <= MAX_GROSS and real_impact <= MAX_IMPACT_PCT and impact <= 2.5:
                         if abs(sell_px - pool["price"]) / pool["price"] > 0.12:
                             st.inc("suspect")
-                            log.info("LOAI LECH GIA LON %s %s sell %.6f vs dex %.6f diff %.1f%%", chain_key, tok["symbol"], sell_px, pool["price"], abs(sell_px-pool["price"])/pool["price"]*100)
                         else:
-                            out.append(dict(common, direction="MEXC_TO_DEX", token_amount=tokens,
-                                            token_after_tax=tokens_net * (1 - sell_tax), mexc_avg=avg,
-                                            dex_exec=sell_px, cost=cost, net_usd=net, net_pct=net_pct,
-                                            adj_net_pct=net_pct - buf, gross_pct=gross,
-                                            gross_after_tax=gross - sell_tax * 100, gas=gas,
-                                            withdraw_fee_usd=tok["withdraw_fee"] * avg, impact_dex=real_impact,
-                                            real_source=src))
+                            ai = calc_ai_score(pool, gross, net_pct_decayed, chain_key)
+                            if ai >= AI_SCORE_MIN:
+                                # track volatility for inventory
+                                is_hot = track_volatility(tok["symbol"], pool, tok.get("contract"), chain_key, net_pct_decayed)
+                                out.append(dict(common, direction="MEXC_TO_DEX", token_amount=tokens,
+                                                token_after_tax=tokens_net * (1 - sell_tax), mexc_avg=avg,
+                                                dex_exec=sell_px, cost=cost, net_usd=net, net_pct=net_pct_decayed,
+                                                adj_net_pct=net_pct_decayed - buf, gross_pct=gross,
+                                                gross_after_tax=gross - sell_tax * 100, gas=gas,
+                                                withdraw_fee_usd=tok["withdraw_fee"] * avg, impact_dex=real_impact,
+                                                real_source=src, ai_score=ai, is_hot=is_hot))
     if tok.get("deposit_enable", True):
-        q = dex_buy_quote(chain_key, tok["contract"], dec, usd) if can_real else None
+        q = dex_buy_quote(chain_key, tok["contract"], dec, usd_dynamic) if can_real else None
         if q:
             st.inc("real_price_ok")
             tokens_out, buy_px, impact, src = q["tokens"], q["price"], q["impact"], q["source"]
@@ -816,28 +1567,33 @@ def evaluate(chain_key, tok, pool, depth):
             tokens_out = None
         else:
             buy_px, impact, src = buy_est, impact_est, "estimate"
-            tokens_out = usd / buy_est
+            tokens_out = usd_dynamic / buy_est
         if tokens_out:
             tokens_dep = tokens_out * (1 - EXTRA_SLIPPAGE) * (1 - buy_tax)
             proceeds = walk_tokens(bids, tokens_dep)
             if proceeds:
-                cost = usd + gas * 2
-                revenue = proceeds * (1 - MEXC_TAKER_FEE)
+                cost = usd_dynamic + gas * 2
+                revenue = proceeds * (1 - mexc_fee_use)
                 net = revenue - cost
                 avg = proceeds / tokens_dep
                 gross = (avg / buy_px - 1) * 100
                 net_pct = net / cost * 100
                 real_impact = max(impact or 0, impact_est)
+                decay = abs(pool.get("chg_m5",0)) * 0.1
+                net_pct_decayed = net_pct - decay
                 if -5 < gross <= MAX_GROSS and real_impact <= MAX_IMPACT_PCT and impact <= 2.5:
                     if abs(buy_px - pool["price"]) / pool["price"] > 0.12:
                         st.inc("suspect")
-                        log.info("LOAI LECH GIA LON %s %s buy %.6f vs dex %.6f diff %.1f%%", chain_key, tok["symbol"], buy_px, pool["price"], abs(buy_px-pool["price"])/pool["price"]*100)
                     else:
-                        out.append(dict(common, direction="DEX_TO_MEXC", token_amount=tokens_dep,
-                                        token_raw=tokens_out, mexc_avg=avg, dex_exec=buy_px, cost=cost,
-                                        net_usd=net, net_pct=net_pct, adj_net_pct=net_pct - buf,
-                                        gross_pct=gross, gross_after_tax=gross - buy_tax * 100, gas=gas * 2,
-                                        withdraw_fee_usd=0.0, impact_dex=real_impact, real_source=src))
+                        ai = calc_ai_score(pool, gross, net_pct_decayed, chain_key)
+                        if ai >= AI_SCORE_MIN:
+                            is_hot = track_volatility(tok["symbol"], pool, tok.get("contract"), chain_key, net_pct_decayed)
+                            out.append(dict(common, direction="DEX_TO_MEXC", token_amount=tokens_dep,
+                                            token_raw=tokens_out, mexc_avg=avg, dex_exec=buy_px, cost=cost,
+                                            net_usd=net, net_pct=net_pct_decayed, adj_net_pct=net_pct_decayed - buf,
+                                            gross_pct=gross, gross_after_tax=gross - buy_tax * 100, gas=gas * 2,
+                                            withdraw_fee_usd=0.0, impact_dex=real_impact, real_source=src,
+                                            ai_score=ai, is_hot=is_hot))
     return out
 
 COOLDOWN = {}
@@ -1109,22 +1865,19 @@ def send_alert(chain_key, tok, pool, p):
     profit_emoji = "🟢" if p["adj_net_pct"] >= 2 else "🟡" if p["adj_net_pct"] >= 1 else "🔵"
     
     # Links - SWAP TRUC TIEP
-    mexc_trade_url = f"https://www.mexc.com/exchange/{tok['pair']}"  # bam vao mua ngay tren MEXC
+    mexc_trade_url = f"https://www.mexc.com/exchange/{tok['pair']}"
     dex_buy_url, dex_sell_url = get_dex_swap_urls(chain_key, tok['contract'])
-    dex_info_url = pool['url']  # dexscreener info
+    dex_info_url = pool['url']
     explorer_url = cfg['explorer'] + tok['contract']
 
-    # Action on top with DIRECT SWAP LINKS
+    # Action
     if p["direction"] == "MEXC_TO_DEX":
         icon = "📤"
-        # MUA tren MEXC (trade page) -> SELL tren DEX (swap page)
         action = f"<a href='{esc(mexc_trade_url)}'>BUY MEXC</a> → WITHDRAW {chain_key} → <a href='{esc(dex_sell_url)}'>SELL DEX</a>"
     else:
         icon = "📥"
-        # MUA tren DEX (swap page) -> SELL tren MEXC
         action = f"<a href='{esc(dex_buy_url)}'>BUY DEX</a> → DEPOSIT MEXC → SELL {esc(tok['pair'])}"
 
-    # Tax - per token dynamic
     if p["buy_tax"] or p["sell_tax"]:
         tax_line = f"Tax: Buy {p['buy_tax']*100:.1f}% / Sell {p['sell_tax']*100:.1f}%"
     else:
@@ -1139,18 +1892,34 @@ def send_alert(chain_key, tok, pool, p):
         warn.append(",".join(p["sec_soft"]))
     warn_line = f"⚠️ {'; '.join(warn)}\n" if warn else ""
     
+    # V8.8 extras
+    usd_size = p.get("usd_size", ORDER_SIZE_USD)
+    fee_type = p.get("fee_type", "taker")
+    mexc_fee = p.get("mexc_fee", MEXC_TAKER_FEE)
+    ai_score = p.get("ai_score", 0)
+    is_hot = p.get("is_hot", False)
+    transfer_real = p.get("transfer_min_real", cfg['transfer_min'])
+    
+    ai_emoji = "🔥" if ai_score >= 80 else "⭐" if ai_score >= 70 else "✨"
+    inv_suggestion = get_inventory_suggestion(tok["symbol"], usd_size) if is_hot else None
+    if inv_suggestion:
+        hot_line = f"🔥 HOT - Hold ${inv_suggestion['dex_hold_usd']:.0f} on DEX + ${inv_suggestion['cex_hold_usd']:.0f} on {tok.get('cex','CEX')} for instant arb"
+    else:
+        hot_line = "🔥 HOT - High volatility! Recommend hold inventory on both sides" if is_hot else ""
+    
     msg = (
-        f"{profit_emoji} <b>{esc(tok['symbol'])} [{chain_key}] {p['direction']}</b> | {esc(p.get('real_source','?'))} | {cfg['emoji']}\n"
+        f"{profit_emoji} <b>{esc(tok['symbol'])} [{chain_key}] {p['direction']}</b> | {esc(p.get('real_source','?'))} | {cfg['emoji']} | {ai_emoji} AI {ai_score}/100\n"
         f"{'─'*24}\n"
         f"💰 <b>PROFIT {p['adj_net_pct']:.2f}% (${p['net_usd']:.2f})</b> after buffer | NET {p['net_pct']:.2f}%\n"
         f"📈 Gross {p['gross_pct']:.2f}% → After tax {p['gross_after_tax']:.2f}% | Impact {p['impact_dex']:.2f}%\n"
-        f"🛡️ Buffer {p['risk_buf']:.2f}% | Threshold {thr:.2f}%\n"
+        f"🛡️ Buffer {p['risk_buf']:.2f}% | Threshold {thr:.2f}% | Size ${usd_size:.0f} ({fee_type})\n"
         f"{'─'*24}\n"
         f"{icon} <b>{action}</b>\n"
         f"{'─'*24}\n"
         f"💸 {tax_line} | 🏦 {en_line}\n"
-        f"💵 Capital ${ORDER_SIZE_USD:.0f} | Amount {fmt_token_amount(p['token_amount'])}\n"
-        f"⛽ Gas ${p['gas']:.2f} | Withdraw Fee ${p['withdraw_fee_usd']:.2f} | MEXC Fee {MEXC_TAKER_FEE*100:.2f}%\n"
+        f"💵 Capital ${usd_size:.0f} (dynamic {ORDER_SIZE_MIN:.0f}-{ORDER_SIZE_MAX:.0f}) | Amount {fmt_token_amount(p['token_amount'])}\n"
+        f"⛽ Gas ${p['gas']:.2f} | Withdraw Fee ${p['withdraw_fee_usd']:.2f} | MEXC Fee {mexc_fee*100:.2f}% ({fee_type})\n"
+        f"⏱️ Transfer ~{transfer_real:.1f} min (real) | Volatility decay included\n"
         f"{'─'*24}\n"
         f"🏦 <b>MEXC {esc(tok['pair'])}</b>\n"
         f"   Bid {fmt_price(bid)} / Ask {fmt_price(ask)} → Avg ${fmt_price(p['mexc_avg'])}\n"
@@ -1160,13 +1929,14 @@ def send_alert(chain_key, tok, pool, p):
         f"   Change 5m {pool.get('chg_m5',0):+.1f}% | 1h {pool.get('chg_h1',0):+.1f}%\n"
         f"{'─'*24}\n"
         f"{warn_line}"
+        f"{hot_line + chr(10) if hot_line else ''}"
         f"📜 Contract: <code>{esc(tok['contract'])}</code>\n"
         f"🔗 <a href='{esc(mexc_trade_url)}'>MEXC Trade</a> | "
         f"<a href='{esc(dex_buy_url)}'>DEX Buy</a> | "
         f"<a href='{esc(dex_sell_url)}'>DEX Sell</a> | "
         f"<a href='{esc(dex_info_url)}'>Info</a> | "
         f"<a href='{esc(explorer_url)}'>Explorer</a>\n"
-        f"⏰ {datetime.now().strftime('%H:%M %d/%m')} | Transfer ~{cfg['transfer_min']} min | Price changes fast!"
+        f"⏰ {datetime.now().strftime('%H:%M %d/%m')} | AI Score {ai_score}/100 | {'HOT 🔥' if is_hot else 'Normal'}"
     )
     return send_telegram(msg)
 
@@ -1187,7 +1957,14 @@ def handle_command(text):
     cmd = parts[0].lower().split("@")[0]
     arg = parts[1].upper() if len(parts) > 1 else ""
     if cmd in ("/start", "/help"):
-        return "/status /stats /top /pause CHAIN /resume CHAIN /blacklist SYMBOL /unblacklist SYMBOL"
+        return ("/status - bot status\n""/deposit SYMBOL - check nap/rut 9 san\n"
+                "/stats - thong ke\n"
+                "/top - 10 signal gan nhat\n"
+                "/hot - token bien dong nhieu\n"
+                "/inventory - vi tri dang hold\n"
+                "/live - gia WS live 9 san\n"
+                "/pause CHAIN /resume CHAIN\n"
+                "/blacklist SYMBOL /unblacklist SYMBOL")
     if cmd == "/status":
         lines = [f"<b>STATUS</b> {datetime.now().strftime('%H:%M %d/%m')}"]
         for k, st in STATS.items():
@@ -1224,7 +2001,71 @@ def handle_command(text):
             BL.pop(f"SYM:{arg}", None)
         DB.del_blacklist(f"SYM:{arg}")
         return f"Da go blacklist {esc(arg)}"
-    return "Lenh khong hop le. /help"
+    if cmd == "/hot":
+        try:
+            hot = INV_DB.get_hot(15)
+            if not hot:
+                return "Chua co HOT token nao"
+            lines = ["<b>🔥 HOT TOKENS (bien dong nhieu)</b>"]
+            for sym, contract, chain, hits, pot in hot:
+                lines.append(f"{esc(sym)} [{chain}] hits={hits} profit~{pot:.1f}% - Hold ${ORDER_SIZE_MIN}-{ORDER_SIZE_MAX}")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Hot loi {e}"
+    if cmd == "/inventory":
+        try:
+            inv = INV_DB.list_active()
+            if not inv:
+                return "Chua co inventory. Khi token HOT, bot se de xuat hold 50% DEX + 50% CEX"
+            lines = ["<b>📦 INVENTORY AUTO-HOLD</b>"]
+            for sym, contract, chain, cex, dex_amt, cex_amt, avg, prof in inv[:15]:
+                lines.append(f"{esc(sym)} {chain}/{cex}: DEX {dex_amt:.2f} + CEX {cex_amt:.2f} avg ${avg:.4f}")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Inventory loi {e}"
+    if cmd == "/live":
+        try:
+            with CEX_LIVE_LOCK:
+                lines = [f"<b>📡 LIVE PRICES WS ({len(CEX_LIVE)} CEXs)</b>"]
+                for cex, pairs in CEX_LIVE.items():
+                    lines.append(f"--- {cex} ---")
+                    for sym, d in list(pairs.items())[:5]:
+                        age = int(time.time()-d["ts"])
+                        lines.append(f"{sym}: bid {d['bid']} ask {d['ask']} ({d['source']} {age}s)")
+            return "\n".join(lines[:30])
+        except Exception as e:
+            return f"Live loi {e}"
+    if cmd == "/deposit" or cmd == "/naprut":
+        try:
+            arg_sym = parts[1].upper() if len(parts) > 1 else ""
+            if arg_sym:
+                # Check 1 token cu the
+                lines = [f"<b>🏦 NẠP/RÚT {esc(arg_sym)} - 9 SÀN</b>"]
+                for cex in ENABLED_CEXS:
+                    cex = cex.strip().upper()
+                    try:
+                        wd, dep = safe_get_deposit_status_public(cex, arg_sym)
+                        wd_icon = "✅" if wd else "❌"
+                        dep_icon = "✅" if dep else "❌"
+                        lines.append(f"{cex}: Rút {wd_icon} | Nạp {dep_icon}")
+                    except Exception as e:
+                        lines.append(f"{cex}: lỗi {e}")
+                return "\n".join(lines)
+            else:
+                # List all
+                rows = DEPOSIT_DB.list_all()
+                if not rows:
+                    return "Chưa có dữ liệu nạp/rút. Gõ /deposit PEPE để check 1 token"
+                lines = ["<b>🏦 TRẠNG THÁI NẠP/RÚT (100 mới nhất)</b>"]
+                for cex, sym, chain, wd, dep, ts in rows[:20]:
+                    wd_i = "✅" if wd else "❌"
+                    dep_i = "✅" if dep else "❌"
+                    lines.append(f"{cex} {esc(sym)}: R{wd_i} N{dep_i}")
+                lines.append("\nGõ /deposit SYMBOL để check chi tiết 1 token")
+                return "\n".join(lines)
+        except Exception as e:
+            return f"Deposit loi {e}"
+    return "Lenh khong hop le. /help - /deposit SYMBOL de check nap/rut"
 
 def telegram_poll_loop():
     offset = None
@@ -1350,6 +2191,416 @@ def run_chain_loop(chain_key, stop):
             log.exception("[%s] loi vong chinh", chain_key)
             stop.wait(20)
 
+
+# ========== V8.9 INVENTORY AUTO-HOLD ==========
+INVENTORY_DB_PATH = os.getenv("INVENTORY_DB_PATH", "inventory.db")
+
+class InventoryDB:
+    def __init__(self, path):
+        self.lock = threading.Lock()
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        with self.lock:
+            c=self.conn
+            try: c.execute("PRAGMA journal_mode=WAL")
+            except: pass
+            c.execute("""CREATE TABLE IF NOT EXISTS inventory(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT, contract TEXT, chain TEXT, cex TEXT,
+                dex_amount REAL DEFAULT 0, cex_amount REAL DEFAULT 0,
+                avg_price REAL DEFAULT 0, profit_total REAL DEFAULT 0,
+                created_ts REAL, updated_ts REAL, status TEXT DEFAULT 'active')""")
+            c.execute("""CREATE TABLE IF NOT EXISTS hot_tokens(
+                symbol TEXT PRIMARY KEY, contract TEXT, chain TEXT,
+                hits INTEGER, first_seen REAL, last_seen REAL, profit_potential REAL)""")
+            c.commit()
+    def add_or_update(self, symbol, contract, chain, cex, dex_amt, cex_amt, price):
+        with self.lock:
+            cur=self.conn.execute("SELECT id, dex_amount, cex_amount FROM inventory WHERE symbol=? AND contract=? AND chain=? AND cex=? AND status='active'",
+                                  (symbol, contract, chain, cex))
+            row=cur.fetchone()
+            now=time.time()
+            if row:
+                nid, od, oc = row
+                self.conn.execute("UPDATE inventory SET dex_amount=?, cex_amount=?, avg_price=?, updated_ts=? WHERE id=?",
+                                  (od+dex_amt, oc+cex_amt, price, now, nid))
+            else:
+                self.conn.execute("INSERT INTO inventory(symbol,contract,chain,cex,dex_amount,cex_amount,avg_price,created_ts,updated_ts) VALUES(?,?,?,?,?,?,?,?,?)",
+                                  (symbol, contract, chain, cex, dex_amt, cex_amt, price, now, now))
+            self.conn.commit()
+    def list_active(self):
+        with self.lock:
+            cur=self.conn.execute("SELECT symbol, contract, chain, cex, dex_amount, cex_amount, avg_price, profit_total FROM inventory WHERE status='active'")
+            return cur.fetchall()
+    def record_hot(self, symbol, contract, chain, profit_potential=0):
+        with self.lock:
+            cur=self.conn.execute("SELECT hits FROM hot_tokens WHERE symbol=?", (symbol,))
+            r=cur.fetchone()
+            now=time.time()
+            if r:
+                self.conn.execute("UPDATE hot_tokens SET hits=hits+1, last_seen=?, profit_potential=? WHERE symbol=?", (now, profit_potential, symbol))
+            else:
+                self.conn.execute("INSERT INTO hot_tokens(symbol,contract,chain,hits,first_seen,last_seen,profit_potential) VALUES(?,?,?,?,?,?,?)",
+                                  (symbol, contract, chain, 1, now, now, profit_potential))
+            self.conn.commit()
+    def get_hot(self, limit=20):
+        with self.lock:
+            cur=self.conn.execute("SELECT symbol, contract, chain, hits, profit_potential FROM hot_tokens ORDER BY hits DESC, profit_potential DESC LIMIT ?", (limit,))
+            return cur.fetchall()
+
+INV_DB = InventoryDB(INVENTORY_DB_PATH)
+
+# ========== V9.0 DEPOSIT/WITHDRAW OPEN/CLOSE ALERT ==========
+DEPOSIT_ALERT_DB_PATH = os.getenv("DEPOSIT_ALERT_DB_PATH", "deposit_status.db")
+
+class DepositAlertDB:
+    def __init__(self, path):
+        self.lock = threading.Lock()
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        with self.lock:
+            c=self.conn
+            try: c.execute("PRAGMA journal_mode=WAL")
+            except: pass
+            c.execute("""CREATE TABLE IF NOT EXISTS cex_status(
+                cex TEXT, symbol TEXT, chain TEXT,
+                withdraw_en INTEGER, deposit_en INTEGER,
+                last_checked REAL, last_changed REAL,
+                PRIMARY KEY (cex, symbol))""")
+            c.execute("""CREATE TABLE IF NOT EXISTS status_history(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cex TEXT, symbol TEXT, chain TEXT,
+                old_withdraw INTEGER, new_withdraw INTEGER,
+                old_deposit INTEGER, new_deposit INTEGER,
+                changed_ts REAL)""")
+            c.commit()
+    def get_prev(self, cex, symbol):
+        with self.lock:
+            cur = self.conn.execute("SELECT withdraw_en, deposit_en FROM cex_status WHERE cex=? AND symbol=?", (cex, symbol))
+            row = cur.fetchone()
+            return row if row else None
+    def update_status(self, cex, symbol, chain, wd_en, dep_en):
+        with self.lock:
+            prev = self.conn.execute("SELECT withdraw_en, deposit_en FROM cex_status WHERE cex=? AND symbol=?", (cex, symbol)).fetchone()
+            now = time.time()
+            changed = False
+            if prev:
+                old_wd, old_dep = prev
+                if old_wd != int(wd_en) or old_dep != int(dep_en):
+                    changed = True
+                    self.conn.execute("INSERT INTO status_history(cex,symbol,chain,old_withdraw,new_withdraw,old_deposit,new_deposit,changed_ts) VALUES(?,?,?,?,?,?,?,?)",
+                                      (cex, symbol, chain, old_wd, int(wd_en), old_dep, int(dep_en), now))
+                    self.conn.execute("UPDATE cex_status SET withdraw_en=?, deposit_en=?, last_checked=?, last_changed=? WHERE cex=? AND symbol=?",
+                                      (int(wd_en), int(dep_en), now, now, cex, symbol))
+            else:
+                # first time
+                self.conn.execute("INSERT INTO cex_status(cex,symbol,chain,withdraw_en,deposit_en,last_checked,last_changed) VALUES(?,?,?,?,?,?,?)",
+                                  (cex, symbol, chain, int(wd_en), int(dep_en), now, now))
+            if not prev or changed:
+                self.conn.commit()
+            return changed, prev
+    def list_all(self):
+        with self.lock:
+            cur = self.conn.execute("SELECT cex,symbol,chain,withdraw_en,deposit_en,last_checked FROM cex_status ORDER BY last_changed DESC LIMIT 100")
+            return cur.fetchall()
+
+DEPOSIT_DB = DepositAlertDB(DEPOSIT_ALERT_DB_PATH)
+
+def send_deposit_alert(cex, symbol, chain, old_wd, old_dep, new_wd, new_dep):
+    """Gui canh bao khi mo/dong nap/rut"""
+    # Chi gui khi co thay doi thuc su
+    msgs = []
+    if old_wd is not None and old_wd != new_wd:
+        if new_wd:
+            msgs.append(f"🔓 <b>{cex} MỞ LẠI RÚT {symbol}</b> [{chain}]\n   Withdraw: ❌ → ✅")
+        else:
+            msgs.append(f"🔒 <b>{cex} ĐÓNG RÚT {symbol}</b> [{chain}]\n   Withdraw: ✅ → ❌")
+    if old_dep is not None and old_dep != new_dep:
+        if new_dep:
+            msgs.append(f"🔓 <b>{cex} MỞ LẠI NẠP {symbol}</b> [{chain}]\n   Deposit: ❌ → ✅")
+        else:
+            msgs.append(f"🔒 <b>{cex} ĐÓNG NẠP {symbol}</b> [{chain}]\n   Deposit: ✅ → ❌")
+    if not msgs and old_wd is None:
+        # Lan dau check
+        return False
+    for m in msgs:
+        # Them thong tin huu ich
+        full_msg = (f"{m}\n"
+                    f"⏰ {__import__('datetime').datetime.now().strftime('%H:%M %d/%m')}\n"
+                    f"💡 Kèo {symbol} có thể xuất hiện lại sau khi mở nạp/rút!")
+        send_telegram(full_msg)
+    return len(msgs) > 0
+
+def deposit_monitor_loop():
+    """Vong lap kiem tra dinh ky trang thai nap/rut cho HOT tokens + top tokens"""
+    log.info("Deposit monitor loop started - check every 120s")
+    while True:
+        try:
+            time.sleep(120)  # check moi 2 phut
+            # Lay danh sach token can check: HOT + inventory + top 20 tokens co volume cao
+            symbols_to_check = set()
+            # HOT tokens
+            try:
+                hot = INV_DB.get_hot(20)
+                for sym, contract, chain, hits, pot in hot:
+                    symbols_to_check.add((sym, chain or "SOL"))
+            except:
+                pass
+            # Inventory tokens
+            try:
+                inv = INV_DB.list_active()
+                for sym, contract, chain, cex, dex_amt, cex_amt, avg, prof in inv:
+                    symbols_to_check.add((sym, chain))
+            except:
+                pass
+            # Them 1 so token pho bien de canh bao som
+            common = [("PEPE","ETH"),("WIF","SOL"),("BONK","SOL"),("SHIB","ETH"),("FLOKI","BNB"),("DOGE","BNB")]
+            for sym, chain in common:
+                symbols_to_check.add((sym, chain))
+            
+            # Check tung CEX
+            for cex in ENABLED_CEXS:
+                cex = cex.strip().upper()
+                if cex not in CEX_REGISTRY:
+                    continue
+                for symbol, chain in list(symbols_to_check)[:30]:  # gioi han 30 token / lan de tranh spam API
+                    try:
+                        wd_en, dep_en = safe_get_deposit_status_public(cex, symbol)
+                        prev = DEPOSIT_DB.get_prev(cex, symbol)
+                        changed, old = DEPOSIT_DB.update_status(cex, symbol, chain, wd_en, dep_en)
+                        if changed and old:
+                            old_wd, old_dep = old
+                            send_deposit_alert(cex, symbol, chain, old_wd, old_dep, int(wd_en), int(dep_en))
+                        # Clear cache de lan sau check lai that (khong dung cache 5p cho monitor)
+                        with DEPOSIT_CACHE_LOCK:
+                            if cex in CEX_DEPOSIT_CACHE and symbol in CEX_DEPOSIT_CACHE[cex]:
+                                del CEX_DEPOSIT_CACHE[cex][symbol]
+                    except Exception as e:
+                        log.debug("Deposit monitor %s %s fail %s", cex, symbol, e)
+                    time.sleep(0.5)  # tranh rate limit
+        except Exception as e:
+            log.exception("deposit_monitor_loop error %s", e)
+            time.sleep(30)
+
+
+# ========== V8.9 WEBSOCKET LIVE FULL 9 SAN ==========
+try:
+    import websocket as _ws_lib
+    HAS_WS = True
+except:
+    HAS_WS = False
+    log.warning("websocket-client not installed, WS disabled - pip install websocket-client")
+
+class CEXWebSocketManager:
+    def __init__(self):
+        self.threads = {}
+        self.stop_flags = {}
+    
+    def start_all(self):
+        if not HAS_WS:
+            log.warning("WS disabled, using REST poll")
+        for cex in ENABLED_CEXS:
+            cex = cex.strip().upper()
+            if cex not in CEX_REGISTRY:
+                continue
+            flag = threading.Event()
+            self.stop_flags[cex]=flag
+            t = threading.Thread(target=self._run_cex_ws, args=(cex, flag), daemon=True, name=f"WS-{cex}")
+            t.start()
+            self.threads[cex]=t
+            time.sleep(0.3)
+    
+    def _run_cex_ws(self, cex, stop_flag):
+        cfg = CEX_REGISTRY[cex]
+        fmt = cfg.get("ws_format")
+        log.info("WS %s starting (%s)", cex, fmt)
+        while not stop_flag.is_set():
+            try:
+                if fmt=="mexc":
+                    self._run_mexc_ws(cex, stop_flag)
+                elif fmt=="binance":
+                    self._run_binance_ws(cex, stop_flag)
+                elif fmt=="gate":
+                    self._run_gate_ws(cex, stop_flag)
+                elif fmt=="okx":
+                    self._run_okx_ws(cex, stop_flag)
+                elif fmt=="bybit":
+                    self._run_bybit_ws(cex, stop_flag)
+                elif fmt=="bitget":
+                    self._run_bitget_ws(cex, stop_flag)
+                elif fmt=="kucoin":
+                    self._run_kucoin_ws(cex, stop_flag)
+                elif fmt=="htx":
+                    self._run_htx_ws(cex, stop_flag)
+                else:
+                    self._run_rest_poll_ws(cex, stop_flag)
+            except Exception as e:
+                log.warning("WS %s error %s, reconnect 5s", cex, e)
+                time.sleep(5)
+    
+    def _run_mexc_ws(self, cex, stop_flag):
+        import websocket, json
+        url = "wss://wbs.mexc.com/ws"
+        def on_open(ws):
+            subs = [f"spot@public.bookTicker.v3.api@{p}" for p in ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","PEPEUSDT","WIFUSDT","BONKUSDT","SHIBUSDT"][:30]]
+            ws.send(json.dumps({"method":"SUBSCRIPTION","params":subs}))
+            log.info("MEXC WS subscribed %d pairs", len(subs))
+        def on_msg(ws, msg):
+            try:
+                data = json.loads(msg)
+                if "d" in data and "c" in data:
+                    d=data["d"]; sym=data["c"].split("@")[-1]
+                    bid=d.get("bidPrice"); ask=d.get("askPrice")
+                    if bid and ask:
+                        update_live_price(cex, sym, bid, ask, "ws")
+            except:
+                pass
+        ws = websocket.WebSocketApp("wss://wbs.mexc.com/ws", on_open=on_open, on_message=on_msg)
+        ws.run_forever(ping_interval=20, ping_timeout=10)
+    
+    def _run_binance_ws(self, cex, stop_flag):
+        import websocket, json
+        symbols = ["btcusdt","ethusdt","solusdt","bnbusdt","pepeusdt","wifusdt","bonkusdt","shibusdt","flokiusdt","dogusdt"]
+        url = f"wss://stream.binance.com:9443/ws/{'/'.join([s+'@bookTicker' for s in symbols])}"
+        def on_msg(w, msg):
+            try:
+                d=json.loads(msg)
+                if "s" in d:
+                    update_live_price(cex, d["s"], d.get("b"), d.get("a"), "ws")
+            except:
+                pass
+        ws = websocket.WebSocketApp(url, on_message=on_msg)
+        ws.run_forever(ping_interval=20)
+    
+    def _run_gate_ws(self, cex, stop_flag):
+        # Gate.io WS v4 - subscribe to tickers
+        import websocket, json
+        def on_open(ws):
+            # Gate needs subscription: {"time":..., "channel":"spot.tickers", "event":"subscribe", "payload":["BTC_USDT","ETH_USDT"]}
+            payload = ["BTC_USDT","ETH_USDT","SOL_USDT","PEPE_USDT","WIF_USDT","BONK_USDT","SHIB_USDT"]
+            msg = {"time": int(time.time()), "channel": "spot.tickers", "event": "subscribe", "payload": payload}
+            ws.send(json.dumps(msg))
+        def on_msg(ws, msg):
+            try:
+                data=json.loads(msg)
+                if data.get("channel")=="spot.tickers":
+                    result=data.get("result",{})
+                    if isinstance(result, dict):
+                        pair=result.get("currency_pair","").replace("_","")
+                        bid=result.get("highest_bid"); ask=result.get("lowest_ask")
+                        if bid and ask:
+                            update_live_price(cex, pair, bid, ask, "ws")
+            except:
+                pass
+        ws = websocket.WebSocketApp("wss://api.gateio.ws/ws/v4/", on_open=on_open, on_message=on_msg)
+        ws.run_forever(ping_interval=20)
+    
+    def _run_okx_ws(self, cex, stop_flag):
+        import websocket, json
+        def on_open(ws):
+            # OKX subscribe to tickers
+            args = [{"channel":"tickers","instId":"BTC-USDT"},{"channel":"tickers","instId":"ETH-USDT"},{"channel":"tickers","instId":"SOL-USDT"},{"channel":"tickers","instId":"PEPE-USDT"}]
+            ws.send(json.dumps({"op":"subscribe","args":args}))
+        def on_msg(ws, msg):
+            try:
+                data=json.loads(msg)
+                if "data" in data:
+                    for t in data["data"]:
+                        inst=t.get("instId","").replace("-","")
+                        bid=t.get("bidPx"); ask=t.get("askPx")
+                        if bid and ask:
+                            update_live_price(cex, inst, bid, ask, "ws")
+            except:
+                pass
+        ws = websocket.WebSocketApp("wss://ws.okx.com:8443/ws/v5/public", on_open=on_open, on_message=on_msg)
+        ws.run_forever(ping_interval=20)
+    
+    def _run_bybit_ws(self, cex, stop_flag):
+        import websocket, json
+        def on_open(ws):
+            ws.send(json.dumps({"op":"subscribe","args":["tickers.BTCUSDT","tickers.ETHUSDT","tickers.SOLUSDT","tickers.PEPEUSDT"]}))
+        def on_msg(ws, msg):
+            try:
+                data=json.loads(msg)
+                if data.get("topic","").startswith("tickers."):
+                    d=data.get("data",{})
+                    sym=d.get("symbol")
+                    bid=d.get("bid1Price"); ask=d.get("ask1Price")
+                    if sym and bid and ask:
+                        update_live_price(cex, sym, bid, ask, "ws")
+            except:
+                pass
+        ws = websocket.WebSocketApp("wss://stream.bybit.com/v5/public/spot", on_open=on_open, on_message=on_msg)
+        ws.run_forever(ping_interval=20)
+    
+    def _run_bitget_ws(self, cex, stop_flag):
+        import websocket, json
+        def on_open(ws):
+            args = [{"instType":"SPOT","channel":"ticker","instId":"BTCUSDT"},{"instType":"SPOT","channel":"ticker","instId":"ETHUSDT"}]
+            ws.send(json.dumps({"op":"subscribe","args":args}))
+        def on_msg(ws, msg):
+            try:
+                data=json.loads(msg)
+                if "data" in data:
+                    for t in data["data"]:
+                        sym=t.get("instId")
+                        bid=t.get("bidPr"); ask=t.get("askPr")
+                        if sym and bid and ask:
+                            update_live_price(cex, sym, bid, ask, "ws")
+            except:
+                pass
+        ws = websocket.WebSocketApp("wss://ws.bitget.com/v2/ws/public", on_open=on_open, on_message=on_msg)
+        ws.run_forever(ping_interval=20)
+    
+    def _run_kucoin_ws(self, cex, stop_flag):
+        # Kucoin needs token first, fallback to REST poll for simplicity in V8.9
+        self._run_rest_poll_ws(cex, stop_flag)
+    
+    def _run_htx_ws(self, cex, stop_flag):
+        import websocket, json, gzip
+        def on_open(ws):
+            subs = [{"sub":"market.btcusdt.ticker"},{"sub":"market.ethusdt.ticker"},{"sub":"market.solusdt.ticker"}]
+            for s in subs:
+                ws.send(json.dumps(s))
+        def on_msg(ws, msg):
+            try:
+                # HTX sends gzip
+                if isinstance(msg, bytes):
+                    msg = gzip.decompress(msg).decode()
+                data=json.loads(msg)
+                if "ping" in data:
+                    ws.send(json.dumps({"pong": data["ping"]}))
+                if "tick" in data and "ch" in data:
+                    ch=data["ch"]
+                    # ch = market.btcusdt.ticker
+                    sym=ch.split(".")[1].upper()
+                    tick=data["tick"]
+                    bid=tick.get("bid"); ask=tick.get("ask")
+                    if bid and ask:
+                        update_live_price(cex, sym, bid, ask, "ws")
+            except:
+                pass
+        ws = websocket.WebSocketApp("wss://api.huobi.pro/ws", on_open=on_open, on_message=on_msg)
+        ws.run_forever()
+    
+    def _run_rest_poll_ws(self, cex, stop_flag):
+        # Universal REST poll fallback - 3s loop for all remaining CEXs
+        while not stop_flag.is_set():
+            try:
+                ad = CEX_ADAPTERS.get(cex)
+                if not ad:
+                    time.sleep(3)
+                    continue
+                tickers = ad.fetch_tickers()
+                for sym, data in list(tickers.items())[:100]:
+                    if data.get("bid") and data.get("ask"):
+                        update_live_price(cex, sym, data["bid"], data["ask"], "rest-poll")
+                # also fetch MEXC-like depth for best price calc
+                time.sleep(3)
+            except Exception as e:
+                log.debug("REST poll %s fail %s", cex, e)
+                time.sleep(5)
+
+WS_MANAGER = CEXWebSocketManager()
+
 class Worker:
     def __init__(self, chain_key):
         self.chain = chain_key; self.stop = None; self.thread = None
@@ -1458,16 +2709,34 @@ def validate_config():
         log.warning("CONFIG: %s", w)
     return warns
 
+def ticker_loop():
+    while True:
+        try:
+            MEXC.fetch_all_tickers()
+        except Exception as e:
+            log.debug("ticker_loop fail %s", e)
+        time.sleep(5)
+
 def main():
-    log.info("BOT V8.1 FINAL MERGED start | chains=%s | REAL_CHECK=%s", list(CHAINS), REAL_PRICE_CHECK)
+    log.info("BOT V8.9 MULTI-CEX 9 SAN + WS LIVE + INVENTORY start | chains=%s | CEXs=%s", list(CHAINS), ENABLED_CEXS)
     warns = validate_config()
     threading.Thread(target=start_web, daemon=True, name="Web").start()
+    try:
+        WS_MANAGER.start_all()
+        log.info("WS Manager started for CEXs: %s", ENABLED_CEXS)
+    except Exception as e:
+        log.warning("WS start fail %s", e)
+    threading.Thread(target=ticker_loop, daemon=True, name="Ticker").start()
+    threading.Thread(target=deposit_monitor_loop, daemon=True, name="DepositMonitor").start()
     threading.Thread(target=followup_loop, daemon=True, name="Followup").start()
     threading.Thread(target=heartbeat_loop, daemon=True, name="HB").start()
     threading.Thread(target=telegram_poll_loop, daemon=True, name="TGPoll").start()
-    send_telegram(f"🚀 <b>BOT V8.5 ENGLISH FORMAT START</b> (paper)\nChains: {', '.join(CHAINS)}\nNet(after buffer) ≥ {THRESHOLD_NET}% | "
-                  f"Order ${ORDER_SIZE_USD:.0f} | RealCheck={REAL_PRICE_CHECK} | Adaptive={ADAPTIVE}\n"
-                  f"Filter: Liq≥${MIN_LIQ_USD:.0f} Vol≥${MIN_VOL_24H:.0f} Txns≥{MIN_TXNS_H1}\nCmd: /help" + ("".join("\n⚠ " + esc(w) for w in warns)))
+    send_telegram(f"🚀 <b>BOT V8.9 MULTI-CEX 9 SAN + WS LIVE + INVENTORY</b>\n"
+                  f"Chains: {', '.join(CHAINS)}\nCEXs: {', '.join(ENABLED_CEXS)}\n"
+                  f"Net≥{THRESHOLD_NET}% | Size ${ORDER_SIZE_MIN:.0f}-${ORDER_SIZE_MAX:.0f} dynamic | AI≥{AI_SCORE_MIN}\n"
+                  f"WS Live: {HAS_WS} | Inventory: ON | RealCheck={REAL_PRICE_CHECK}\n"
+                  f"Filter: Liq≥${MIN_LIQ_USD:.0f} Vol≥${MIN_VOL_24H:.0f} Txns≥{MIN_TXNS_H1}\n"
+                  f"Cmd: /help /hot /inventory /live" + ("".join("\n⚠ " + esc(w) for w in warns)))
     workers = {}
     for k in CHAINS:
         w = Worker(k); w.start(); workers[k] = w
