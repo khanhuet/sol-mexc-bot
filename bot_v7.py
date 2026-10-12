@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-BOT V8.5 - ENGLISH + ACTION ON TOP + CLICKABLE BUY DEX
-- English all notifications
-- Action 📥 BUY DEX → DEPOSIT MEXC → SELL ... on top with hyperlink
-- Tax per contract dynamic
-- JUPITER_API_KEY + DEX_LIMIT_SEC=2.5 fix
+BOT V8.7 - PROFIT ON TOP, BUY BELOW PROFIT
+- Structure: Header -> Profit -> BUY action -> Details
+- BUY DEX -> direct swap (jup.ag / pancakeswap / uniswap)
+- BUY MEXC -> mexc.com/exchange/PAIR
+- English
 """
 import hashlib, hmac, html, json, logging, math, os, re, sqlite3, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
@@ -1074,24 +1074,55 @@ def send_telegram(text):
         log.warning("Telegram loi: %s", e)
         return False
 
+def get_dex_swap_urls(chain_key, contract):
+    """Tra ve (buy_url, sell_url) swap truc tiep, khong phai dexscreener"""
+    c = contract
+    if chain_key == "SOL":
+        # Jupiter - buy: SOL -> token, sell: token -> SOL
+        buy = f"https://jup.ag/swap/SOL-{c}"
+        sell = f"https://jup.ag/swap/{c}-SOL"
+    elif chain_key == "BNB":
+        buy = f"https://pancakeswap.finance/swap?outputCurrency={c}&chainId=56"
+        sell = f"https://pancakeswap.finance/swap?inputCurrency={c}&outputCurrency=0x55d398326f99059fF775485246999027B3197955&chainId=56"
+    elif chain_key == "BASE":
+        buy = f"https://app.uniswap.org/#/swap?chain=base&outputCurrency={c}"
+        sell = f"https://app.uniswap.org/#/swap?chain=base&inputCurrency={c}"
+    elif chain_key == "ETH":
+        buy = f"https://app.uniswap.org/#/swap?outputCurrency={c}&chain=mainnet"
+        sell = f"https://app.uniswap.org/#/swap?inputCurrency={c}&chain=mainnet"
+    elif chain_key == "POLYGON":
+        buy = f"https://app.uniswap.org/#/swap?chain=polygon&outputCurrency={c}"
+        sell = f"https://app.uniswap.org/#/swap?chain=polygon&inputCurrency={c}"
+    elif chain_key == "ARBITRUM":
+        buy = f"https://app.uniswap.org/#/swap?chain=arbitrum&outputCurrency={c}"
+        sell = f"https://app.uniswap.org/#/swap?chain=arbitrum&inputCurrency={c}"
+    else:
+        # fallback: dexscreener
+        buy = f"https://dexscreener.com/{CHAINS[chain_key]['dex_chain']}/{c}"
+        sell = buy
+    return buy, sell
+
 def send_alert(chain_key, tok, pool, p):
     cfg = CHAINS[chain_key]
     bid, ask = p["mexc_best"]
     thr = adaptive_threshold(chain_key)
     profit_emoji = "🟢" if p["adj_net_pct"] >= 2 else "🟡" if p["adj_net_pct"] >= 1 else "🔵"
     
-    # Links
-    mexc_url = f"https://www.mexc.com/exchange/{tok['pair']}"
-    dex_url = pool['url']
+    # Links - SWAP TRUC TIEP
+    mexc_trade_url = f"https://www.mexc.com/exchange/{tok['pair']}"  # bam vao mua ngay tren MEXC
+    dex_buy_url, dex_sell_url = get_dex_swap_urls(chain_key, tok['contract'])
+    dex_info_url = pool['url']  # dexscreener info
     explorer_url = cfg['explorer'] + tok['contract']
 
-    # Action on top with links
+    # Action on top with DIRECT SWAP LINKS
     if p["direction"] == "MEXC_TO_DEX":
         icon = "📤"
-        action = f"<a href='{esc(mexc_url)}'>BUY MEXC</a> → WITHDRAW {chain_key} → <a href='{esc(dex_url)}'>SELL DEX</a>"
+        # MUA tren MEXC (trade page) -> SELL tren DEX (swap page)
+        action = f"<a href='{esc(mexc_trade_url)}'>BUY MEXC</a> → WITHDRAW {chain_key} → <a href='{esc(dex_sell_url)}'>SELL DEX</a>"
     else:
         icon = "📥"
-        action = f"<a href='{esc(dex_url)}'>BUY DEX</a> → DEPOSIT MEXC → SELL {esc(tok['pair'])}"
+        # MUA tren DEX (swap page) -> SELL tren MEXC
+        action = f"<a href='{esc(dex_buy_url)}'>BUY DEX</a> → DEPOSIT MEXC → SELL {esc(tok['pair'])}"
 
     # Tax - per token dynamic
     if p["buy_tax"] or p["sell_tax"]:
@@ -1111,11 +1142,11 @@ def send_alert(chain_key, tok, pool, p):
     msg = (
         f"{profit_emoji} <b>{esc(tok['symbol'])} [{chain_key}] {p['direction']}</b> | {esc(p.get('real_source','?'))} | {cfg['emoji']}\n"
         f"{'─'*24}\n"
-        f"{icon} <b>{action}</b>\n"
-        f"{'─'*24}\n"
         f"💰 <b>PROFIT {p['adj_net_pct']:.2f}% (${p['net_usd']:.2f})</b> after buffer | NET {p['net_pct']:.2f}%\n"
         f"📈 Gross {p['gross_pct']:.2f}% → After tax {p['gross_after_tax']:.2f}% | Impact {p['impact_dex']:.2f}%\n"
         f"🛡️ Buffer {p['risk_buf']:.2f}% | Threshold {thr:.2f}%\n"
+        f"{'─'*24}\n"
+        f"{icon} <b>{action}</b>\n"
         f"{'─'*24}\n"
         f"💸 {tax_line} | 🏦 {en_line}\n"
         f"💵 Capital ${ORDER_SIZE_USD:.0f} | Amount {fmt_token_amount(p['token_amount'])}\n"
@@ -1130,8 +1161,10 @@ def send_alert(chain_key, tok, pool, p):
         f"{'─'*24}\n"
         f"{warn_line}"
         f"📜 Contract: <code>{esc(tok['contract'])}</code>\n"
-        f"🔗 <a href='{esc(mexc_url)}'>MEXC</a> | "
-        f"<a href='{esc(dex_url)}'>DEX</a> | "
+        f"🔗 <a href='{esc(mexc_trade_url)}'>MEXC Trade</a> | "
+        f"<a href='{esc(dex_buy_url)}'>DEX Buy</a> | "
+        f"<a href='{esc(dex_sell_url)}'>DEX Sell</a> | "
+        f"<a href='{esc(dex_info_url)}'>Info</a> | "
         f"<a href='{esc(explorer_url)}'>Explorer</a>\n"
         f"⏰ {datetime.now().strftime('%H:%M %d/%m')} | Transfer ~{cfg['transfer_min']} min | Price changes fast!"
     )
