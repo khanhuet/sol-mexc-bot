@@ -153,9 +153,9 @@ class RateLimiter:
             time.sleep(d)
 
 MEXC_LIMITER = RateLimiter(0.05)
-DEX_LIMITER = RateLimiter(env_float("DEX_LIMIT_SEC", 1.5))
-JUP_LIMITER = RateLimiter(0.25)
-PARA_LIMITER = RateLimiter(0.3)
+DEX_LIMITER = RateLimiter(env_float("DEX_LIMIT_SEC", 2.5))
+JUP_LIMITER = RateLimiter(0.5)
+PARA_LIMITER = RateLimiter(0.6)
 TAX_LIMITER = RateLimiter(0.4)
 RPC_LIMITER = RateLimiter(0.15)
 
@@ -283,7 +283,7 @@ class ApiHealth:
                 s["ok"] += 1; s["consec"] = 0; self.alerted.pop(name, None)
             else:
                 s["fail"] += 1; s["consec"] += 1
-                if s["consec"] >= 15 and time.time() - self.alerted.get(name, 0) > 1800:
+                if s["consec"] >= 30 and time.time() - self.alerted.get(name, 0) > 3600:
                     self.alerted[name] = time.time(); need = True
         if need:
             send_telegram(f"🚨 API <b>{esc(name)}</b> loi lien tuc {s['consec']} lan.")
