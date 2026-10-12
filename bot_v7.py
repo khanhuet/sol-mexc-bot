@@ -40,7 +40,7 @@ LBANK_API_KEY = os.getenv("LBANK_API_KEY", ""); LBANK_SECRET = os.getenv("LBANK_
 PORT = int(os.getenv("PORT", 10000)); DB_PATH = os.getenv("DB_PATH", "paper_trades.db"); ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 ORDER_SIZE_USD = env_float("ORDER_SIZE_USD", 500); ORDER_SIZE_MIN = env_float("ORDER_SIZE_MIN", 200); ORDER_SIZE_MAX = env_float("ORDER_SIZE_MAX", 2000)
 SIZE_LIQ_FRAC = env_float("SIZE_LIQ_FRAC", 0.003); SIZE_DEPTH_FRAC = env_float("SIZE_DEPTH_FRAC", 0.6); NEW_POOL_MAX_SIZE = env_float("NEW_POOL_MAX_SIZE", 300)
-THRESHOLD_NET = env_float("THRESHOLD_NET", 0.8); MIN_NET_USD = env_float("MIN_NET_USD", 3.0); PREFILTER_GROSS = env_float("PREFILTER_GROSS", 0.8)
+THRESHOLD_NET = env_float("THRESHOLD_NET", 0.5); MIN_NET_USD = env_float("MIN_NET_USD", 1.5); PREFILTER_GROSS = env_float("PREFILTER_GROSS", 0.4)
 MAX_GROSS = env_float("MAX_GROSS", 7.0); MAX_IMPACT_PCT = env_float("MAX_IMPACT_PCT", 0.8); MIN_LIQ_USD = env_float("MIN_LIQ_USD", 90000)
 MIN_VOL_24H = env_float("MIN_VOL_24H", 40000); MIN_TXNS_H1 = int(env_float("MIN_TXNS_H1", 15)); MIN_POOL_AGE_H = env_float("MIN_POOL_AGE_H", 24)
 ALLOW_NEW_POOL = env_bool("ALLOW_NEW_POOL", "0"); MIN_POOL_AGE_NEW_H = env_float("MIN_POOL_AGE_NEW_H", 3); NEW_POOL_BUFFER = env_float("NEW_POOL_BUFFER", 0.8)
@@ -57,6 +57,27 @@ STUCK_SEC = env_float("STUCK_SEC", 900); STATIC_TTL = env_float("STATIC_TTL", 18
 ADAPTIVE = env_bool("ADAPTIVE", "1"); BAD_STREAK_BLACKLIST = int(env_float("BAD_STREAK_BLACKLIST", 3)); BLACKLIST_HOURS = env_float("BLACKLIST_HOURS", 24)
 HEARTBEAT_MIN = env_float("HEARTBEAT_MIN", 60)
 CEX_EXTRA_MIN = {"MEXC":2.0,"GATE":3.0,"BYBIT":3.0,"BINANCE":3.0,"OKX":3.0,"KUCOIN":3.0,"BITGET":3.0,"BINGX":3.0,"HTX":3.0,"LBANK":3.0}
+# V10.2 features
+def as_bool(v,default=False):
+    if v is None: return default
+    if isinstance(v,bool): return v
+    if isinstance(v,(int,float)): return v!=0
+    return str(v).strip().lower() in ("1","true","yes","on","allowed","enable","enabled")
+def status_ok(v):
+    allow = os.getenv("ALLOW_UNVERIFIED_STATUS","0").strip().lower() in ("1","true","yes","on")
+    if v is None: return allow
+    return bool(v)
+def status_icon(v): return "❓" if v is None else ("✅" if v else "❌")
+def unverified_listings(cex,pairs):
+    allow = os.getenv("ALLOW_UNVERIFIED_STATUS","0").strip().lower() in ("1","true","yes","on")
+    if not allow: return []
+    out=[]
+    for pair,sym in pairs.items():
+        for ch in CHAINS: out.append({"cex":cex,"symbol":sym,"contract":"","dedup_key":f"{ch}_{sym}","chain":ch,"cex_pair":pair,"raw_network":"?","withdraw_fee":None,"withdraw_min":0.0,"withdraw_enable":None,"deposit_enable":None,"contract_inferred":False})
+    return out
+ALLOW_UNVERIFIED_STATUS = os.getenv("ALLOW_UNVERIFIED_STATUS","0").strip().lower() in ("1","true","yes","on")
+UNVERIFIED_BUFFER = float(os.getenv("UNVERIFIED_BUFFER","0.8"))
+
 
 JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", ""); JUPITER_LITE_URL = os.getenv("JUPITER_LITE_URL", "https://lite-api.jup.ag/swap/v1/quote")
 JUPITER_PRO_URL = os.getenv("JUPITER_PRO_URL", "https://api.jup.ag/swap/v1/quote"); PARASWAP_URL = os.getenv("PARASWAP_URL", "https://api.paraswap.io/prices")
@@ -104,12 +125,22 @@ OKX_LIMITER=RateLimiter(0.15); KUCOIN_LIMITER=RateLimiter(0.15); BITGET_LIMITER=
 HTX_LIMITER=RateLimiter(0.15); LBANK_LIMITER=RateLimiter(0.15)
 DEX_LIMITER=RateLimiter(env_float("DEX_LIMIT_SEC",0.4)); JUP_LIMITER=RateLimiter(0.25); PARA_LIMITER=RateLimiter(0.3); SEC_LIMITER=RateLimiter(0.4); RPC_LIMITER=RateLimiter(0.15)
 DEX_429_UNTIL=0.0; DEX_429_LOCK=threading.Lock()
-def http_get(url,params=None,headers=None,limiter=None,timeout=15,retries=2):
+def http_get(url,params=None,headers=None,limiter=None,timeout=15,retries=3):
     global DEX_429_UNTIL
     is_dex="dexscreener.com" in url
     if is_dex:
         with DEX_429_LOCK:
             if time.time()<DEX_429_UNTIL: return None
+    # Default headers to bypass WAF
+    base_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "application/json",
+    }
+    if headers:
+        base_headers.update(headers)
+    headers = base_headers
     for attempt in range(retries+1):
         try:
             if limiter: limiter.wait()
@@ -365,10 +396,34 @@ class GateEx(Exchange):
 class BybitEx(Exchange):
     name="BYBIT"
     def load_pairs(self):
-        r=http_get(f"{BYBIT_BASE}/v5/market/instruments-info",params={"category":"spot","limit":1000},limiter=BYBIT_LIMITER,timeout=20)
-        if not r or r.status_code!=200: 
-            log.warning("Bybit instruments fail %s", r.status_code if r else "no response")
+        for attempt in range(3):
+            r=http_get(f"{BYBIT_BASE}/v5/market/instruments-info",params={"category":"spot","limit":1000},limiter=BYBIT_LIMITER,timeout=20)
+            if r and r.status_code==200:
+                break
+            time.sleep(1+attempt)
+        if r and r.status_code==200:
+            out={}
+            try:
+                for s in r.json().get("result",{}).get("list",[]):
+                    if s.get("quoteCoin")=="USDT" and s.get("status")=="Trading": out[f"{s.get('baseCoin')}USDT"]=s.get("baseCoin")
+                if out:
+                    return out
+            except Exception as e:
+                log.warning("Bybit parse fail %s", e)
+        # Fallback: use tickers
+        log.warning("Bybit instruments fail, fallback to tickers")
+        r=http_get(f"{BYBIT_BASE}/v5/market/tickers",params={"category":"spot"},limiter=BYBIT_LIMITER,timeout=20)
+        if not r or r.status_code!=200:
+            log.warning("Bybit tickers fail %s", r.status_code if r else "no response")
             return {}
+        out={}
+        try:
+            for t in r.json().get("result",{}).get("list",[]):
+                sym=t.get("symbol") or ""
+                if sym.endswith("USDT"): out[sym]=sym[:-4]
+        except Exception as e:
+            log.warning("Bybit tickers parse %s", e)
+        return out
         out={}
         try:
             for s in r.json().get("result",{}).get("list",[]):
@@ -426,10 +481,23 @@ class BybitEx(Exchange):
 class BinanceEx(Exchange):
     name="BINANCE"
     def load_pairs(self):
-        r=http_get(f"{BINANCE_BASE}/api/v3/exchangeInfo",limiter=BINANCE_LIMITER,timeout=20)
+        bases = [BINANCE_BASE, "https://api1.binance.com", "https://api2.binance.com", "https://api3.binance.com", "https://data-api.binance.vision"]
+        r = None
+        for base in bases:
+            r=http_get(f"{base}/api/v3/exchangeInfo",limiter=BINANCE_LIMITER,timeout=20)
+            if r and r.status_code==200:
+                break
+            time.sleep(0.5)
         if not r or r.status_code!=200: 
             log.warning("Binance exchangeInfo fail %s", r.status_code if r else "no response")
             return {}
+        out={}
+        try:
+            for s in r.json().get("symbols",[]):
+                if s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING": out[s["symbol"]]=s["baseAsset"]
+        except Exception as e:
+            log.warning("Binance parse %s", e)
+        return out
         out={}
         for s in r.json().get("symbols",[]):
             if s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING": out[s["symbol"]]=s["baseAsset"]
@@ -747,11 +815,13 @@ class MultiData:
                     pairs={}
                 try:
                     nets=ex.load_networks(pairs) if pairs else []
+                    if nets is None:
+                        # V10.2: chua xac minh -> tao listing tam
+                        nets=unverified_listings(name,pairs) if 'unverified_listings' in globals() else []
                 except Exception as e:
                     log.error("Lam moi %s networks loi: %s", name, e)
                     nets=[]
                 if not pairs and not nets:
-                    # van tra ve rong de bot van chay book
                     log.warning("%s: 0 pair/network - van tiep tuc bang book price", name)
                 return name, nets
             ok_any=False
@@ -1396,6 +1466,7 @@ def start_web():
         from waitress import serve; serve(app,host="0.0.0.0",port=PORT)
     except ImportError: app.run(host="0.0.0.0",port=PORT)
 def validate_config():
+    # Log for debugging no signals
     w=[]
     if MIN_LIQ_USD*SIZE_LIQ_FRAC<ORDER_SIZE_MIN: w.append(f"MIN_LIQ_USD*SIZE_LIQ_FRAC = ${MIN_LIQ_USD*SIZE_LIQ_FRAC:.0f} < ORDER_SIZE_MIN")
     if "GATE" in ENABLED_CEXS and not (GATE_API_KEY and GATE_SECRET): w.append("Thieu GATE_API_KEY/SECRET: chieu GATE->DEX bi tat phi rut")
