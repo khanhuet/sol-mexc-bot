@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-BOT V8.3 - DAILY HEARTBEAT 21h + CLEAN FORMAT - MEXC <-> DEX arbitrage (PAPER)
-Base: V8.0 user (decimals via RPC, risk buffer, adaptive, blacklist, telegram commands)
-+ Fixes: WSOL for SOL native, LRU cache, strict symbol_ok, circuit breaker
+BOT V8.5 - ENGLISH + ACTION ON TOP + CLICKABLE BUY DEX
+- English all notifications
+- Action 📥 BUY DEX → DEPOSIT MEXC → SELL ... on top with hyperlink
+- Tax per contract dynamic
+- JUPITER_API_KEY + DEX_LIMIT_SEC=2.5 fix
 """
 import hashlib, hmac, html, json, logging, math, os, re, sqlite3, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
@@ -1074,60 +1076,64 @@ def send_telegram(text):
 
 def send_alert(chain_key, tok, pool, p):
     cfg = CHAINS[chain_key]
-    if p["direction"] == "MEXC_TO_DEX":
-        action = f"MUA MEXC → RUT {chain_key} → BAN DEX"
-        icon = "📤"
-    else:
-        action = f"MUA DEX → NAP MEXC → BAN {tok['pair']}"
-        icon = "📥"
     bid, ask = p["mexc_best"]
     thr = adaptive_threshold(chain_key)
+    profit_emoji = "🟢" if p["adj_net_pct"] >= 2 else "🟡" if p["adj_net_pct"] >= 1 else "🔵"
     
-    # Tax
-    if p["buy_tax"] or p["sell_tax"]:
-        tax_line = f"💸 Tax: Buy {p['buy_tax']*100:.1f}% / Sell {p['sell_tax']*100:.1f}%"
+    # Links
+    mexc_url = f"https://www.mexc.com/exchange/{tok['pair']}"
+    dex_url = pool['url']
+    explorer_url = cfg['explorer'] + tok['contract']
+
+    # Action on top with links
+    if p["direction"] == "MEXC_TO_DEX":
+        icon = "📤"
+        action = f"<a href='{esc(mexc_url)}'>BUY MEXC</a> → WITHDRAW {chain_key} → <a href='{esc(dex_url)}'>SELL DEX</a>"
     else:
-        tax_line = "💸 Tax: 0%"
+        icon = "📥"
+        action = f"<a href='{esc(dex_url)}'>BUY DEX</a> → DEPOSIT MEXC → SELL {esc(tok['pair'])}"
+
+    # Tax - per token dynamic
+    if p["buy_tax"] or p["sell_tax"]:
+        tax_line = f"Tax: Buy {p['buy_tax']*100:.1f}% / Sell {p['sell_tax']*100:.1f}%"
+    else:
+        tax_line = "Tax: 0%"
     
-    # Deposit/withdraw
-    en_line = f"🏦 Nap: {'✅' if p.get('deposit_enable') else '❌'} | Rut: {'✅' if p.get('withdraw_enable') else '❌'}"
+    en_line = f"Deposit: {'✅' if p.get('deposit_enable') else '❌'} | Withdraw: {'✅' if p.get('withdraw_enable') else '❌'}"
     
-    # Warning
     warn = []
     if not p.get("sec_known") and cfg.get("evm"):
-        warn.append("chua co security data")
+        warn.append("no security data")
     if p.get("sec_soft"):
         warn.append(",".join(p["sec_soft"]))
     warn_line = f"⚠️ {'; '.join(warn)}\n" if warn else ""
     
-    # Profit box
-    profit_emoji = "🟢" if p["adj_net_pct"] >= 2 else "🟡" if p["adj_net_pct"] >= 1 else "🔵"
-    
     msg = (
         f"{profit_emoji} <b>{esc(tok['symbol'])} [{chain_key}] {p['direction']}</b> | {esc(p.get('real_source','?'))} | {cfg['emoji']}\n"
         f"{'─'*24}\n"
-        f"💰 <b>LAI {p['adj_net_pct']:.2f}% (${p['net_usd']:.2f})</b> sau buffer | NET {p['net_pct']:.2f}%\n"
-        f"📈 Gross {p['gross_pct']:.2f}% → Sau tax {p['gross_after_tax']:.2f}% | Impact {p['impact_dex']:.2f}%\n"
-        f"🛡️ Buffer {p['risk_buf']:.2f}% | Nguong {thr:.2f}%\n"
+        f"{icon} <b>{action}</b>\n"
         f"{'─'*24}\n"
-        f"{tax_line} | {en_line}\n"
-        f"💵 Von ${ORDER_SIZE_USD:.0f} | Token {fmt_token_amount(p['token_amount'])}\n"
-        f"⛽ Gas ${p['gas']:.2f} | Rut ${p['withdraw_fee_usd']:.2f} | Phi MEXC {MEXC_TAKER_FEE*100:.2f}%\n"
+        f"💰 <b>PROFIT {p['adj_net_pct']:.2f}% (${p['net_usd']:.2f})</b> after buffer | NET {p['net_pct']:.2f}%\n"
+        f"📈 Gross {p['gross_pct']:.2f}% → After tax {p['gross_after_tax']:.2f}% | Impact {p['impact_dex']:.2f}%\n"
+        f"🛡️ Buffer {p['risk_buf']:.2f}% | Threshold {thr:.2f}%\n"
+        f"{'─'*24}\n"
+        f"💸 {tax_line} | 🏦 {en_line}\n"
+        f"💵 Capital ${ORDER_SIZE_USD:.0f} | Amount {fmt_token_amount(p['token_amount'])}\n"
+        f"⛽ Gas ${p['gas']:.2f} | Withdraw Fee ${p['withdraw_fee_usd']:.2f} | MEXC Fee {MEXC_TAKER_FEE*100:.2f}%\n"
         f"{'─'*24}\n"
         f"🏦 <b>MEXC {esc(tok['pair'])}</b>\n"
-        f"   Bid {fmt_price(bid)} / Ask {fmt_price(ask)} → TB ${fmt_price(p['mexc_avg'])}\n"
+        f"   Bid {fmt_price(bid)} / Ask {fmt_price(ask)} → Avg ${fmt_price(p['mexc_avg'])}\n"
         f"🦄 <b>{esc(pool['dex'])} {esc(pool['pair_name'])}</b>\n"
-        f"   DS ${fmt_price(pool['price'])} → Thuc thi ${fmt_price(p['dex_exec'])}\n"
-        f"   💧 ${pool['liq']:,.0f} | Vol ${pool['vol24']:,.0f} | Tx1h {pool['txns_h1']} | Tuoi {pool.get('age_h',0):.0f}h\n"
-        f"   Bien dong 5m {pool.get('chg_m5',0):+.1f}% | 1h {pool.get('chg_h1',0):+.1f}%\n"
+        f"   DS ${fmt_price(pool['price'])} → Exec ${fmt_price(p['dex_exec'])}\n"
+        f"   💧 ${pool['liq']:,.0f} | Vol ${pool['vol24']:,.0f} | Tx1h {pool['txns_h1']} | Age {pool.get('age_h',0):.0f}h\n"
+        f"   Change 5m {pool.get('chg_m5',0):+.1f}% | 1h {pool.get('chg_h1',0):+.1f}%\n"
         f"{'─'*24}\n"
         f"{warn_line}"
-        f"{icon} <b>{esc(action)}</b>\n\n"
         f"📜 Contract: <code>{esc(tok['contract'])}</code>\n"
-        f"🔗 <a href='https://www.mexc.com/exchange/{esc(tok['pair'])}'>MEXC</a> | "
-        f"<a href='{esc(pool['url'])}'>DEX</a> | "
-        f"<a href='{esc(cfg['explorer'] + tok['contract'])}'>Explorer</a>\n"
-        f"⏰ {datetime.now().strftime('%H:%M %d/%m')} | Chuyen ~{cfg['transfer_min']} phut | Gia thay doi nhanh!"
+        f"🔗 <a href='{esc(mexc_url)}'>MEXC</a> | "
+        f"<a href='{esc(dex_url)}'>DEX</a> | "
+        f"<a href='{esc(explorer_url)}'>Explorer</a>\n"
+        f"⏰ {datetime.now().strftime('%H:%M %d/%m')} | Transfer ~{cfg['transfer_min']} min | Price changes fast!"
     )
     return send_telegram(msg)
 
@@ -1337,8 +1343,8 @@ def heartbeat_loop():
             if now_vn.hour == 21 and now_vn.minute < 2:
                 today = now_vn.date()
                 if last_sent != today:
-                    msg = (f"📊 <b>BAO CAO NGAY {now_vn.strftime('%d/%m/%Y')} - 21:00</b>\n"
-                           f"Von: ${ORDER_SIZE_USD:.0f} | Real: {REAL_PRICE_CHECK} | Require: {REQUIRE_REAL_PRICE}\n"
+                    msg = (f"📊 <b>DAILY REPORT {now_vn.strftime('%d/%m/%Y')} - 21:00</b>\n"
+                           f"Capital: ${ORDER_SIZE_USD:.0f} | Real: {REAL_PRICE_CHECK} | Require: {REQUIRE_REAL_PRICE}\n"
                            f"{'─'*20}\n")
                     total_sig = 0
                     for k, st in STATS.items():
@@ -1348,7 +1354,7 @@ def heartbeat_loop():
                         total_sig += s['signals']
                         thr = adaptive_threshold(k)
                         msg += (f"{CHAINS[k]['emoji']} <b>{k}</b>: "
-                                f"Quet {s['attempted']} | Loc {s['fetched']} | Co hoi {s['opportunity']} | "
+                                f"Scanned {s['attempted']} | Fetched {s['fetched']} | Opp {s['opportunity']} | "
                                 f"✅ {s['signals']} | Sus {s['suspect']}\n"
                                 f"   RealOK {s['real_price_ok']} | Fail {s['real_price_fail']} | Thr {thr:.2f}%\n")
                     msg += f"\n{'─'*20}\nAPI: {esc(API.line())}\n\n{summary_text(8)}"
@@ -1426,9 +1432,9 @@ def main():
     threading.Thread(target=followup_loop, daemon=True, name="Followup").start()
     threading.Thread(target=heartbeat_loop, daemon=True, name="HB").start()
     threading.Thread(target=telegram_poll_loop, daemon=True, name="TGPoll").start()
-    send_telegram(f"🚀 <b>BOT V8.1 FINAL MERGED START</b> (paper)\nChains: {', '.join(CHAINS)}\nNet(sau buffer) ≥ {THRESHOLD_NET}% | "
+    send_telegram(f"🚀 <b>BOT V8.5 ENGLISH FORMAT START</b> (paper)\nChains: {', '.join(CHAINS)}\nNet(after buffer) ≥ {THRESHOLD_NET}% | "
                   f"Order ${ORDER_SIZE_USD:.0f} | RealCheck={REAL_PRICE_CHECK} | Adaptive={ADAPTIVE}\n"
-                  f"Filter: Liq≥${MIN_LIQ_USD:.0f} Vol≥${MIN_VOL_24H:.0f} Txns≥{MIN_TXNS_H1}\nLenh: /help" + ("".join("\n⚠ " + esc(w) for w in warns)))
+                  f"Filter: Liq≥${MIN_LIQ_USD:.0f} Vol≥${MIN_VOL_24H:.0f} Txns≥{MIN_TXNS_H1}\nCmd: /help" + ("".join("\n⚠ " + esc(w) for w in warns)))
     workers = {}
     for k in CHAINS:
         w = Worker(k); w.start(); workers[k] = w
