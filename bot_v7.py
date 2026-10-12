@@ -365,8 +365,10 @@ class GateEx(Exchange):
 class BybitEx(Exchange):
     name="BYBIT"
     def load_pairs(self):
-        r=http_get(f"{BYBIT_BASE}/v5/market/instruments-info",params={"category":"spot"},limiter=BYBIT_LIMITER,timeout=20)
-        if not r or r.status_code!=200: raise RuntimeError("Bybit fail")
+        r=http_get(f"{BYBIT_BASE}/v5/market/instruments-info",params={"category":"spot","limit":1000},limiter=BYBIT_LIMITER,timeout=20)
+        if not r or r.status_code!=200: 
+            log.warning("Bybit instruments fail %s", r.status_code if r else "no response")
+            return {}
         out={}
         try:
             for s in r.json().get("result",{}).get("list",[]):
@@ -425,7 +427,9 @@ class BinanceEx(Exchange):
     name="BINANCE"
     def load_pairs(self):
         r=http_get(f"{BINANCE_BASE}/api/v3/exchangeInfo",limiter=BINANCE_LIMITER,timeout=20)
-        if not r or r.status_code!=200: raise RuntimeError("Binance fail")
+        if not r or r.status_code!=200: 
+            log.warning("Binance exchangeInfo fail %s", r.status_code if r else "no response")
+            return {}
         out={}
         for s in r.json().get("symbols",[]):
             if s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING": out[s["symbol"]]=s["baseAsset"]
@@ -735,9 +739,21 @@ class MultiData:
         events=[]
         try:
             def load(name):
-                ex=EXCHANGES[name]; pairs=ex.load_pairs()
-                if not pairs: raise RuntimeError("khong co pair")
-                return name, ex.load_networks(pairs)
+                ex=EXCHANGES[name]
+                try:
+                    pairs=ex.load_pairs()
+                except Exception as e:
+                    log.error("Lam moi %s pairs loi: %s", name, e)
+                    pairs={}
+                try:
+                    nets=ex.load_networks(pairs) if pairs else []
+                except Exception as e:
+                    log.error("Lam moi %s networks loi: %s", name, e)
+                    nets=[]
+                if not pairs and not nets:
+                    # van tra ve rong de bot van chay book
+                    log.warning("%s: 0 pair/network - van tiep tuc bang book price", name)
+                return name, nets
             ok_any=False
             with ThreadPoolExecutor(max_workers=len(EXCHANGES)) as pool:
                 futs={n:pool.submit(load,n) for n in EXCHANGES}
@@ -1331,7 +1347,7 @@ def heartbeat_loop():
     while True:
         time.sleep(30)
         try:
-            now_vn=datetime.utcnow()+timedelta(hours=7)
+            now_vn=datetime.now()+timedelta(hours=7)  # use local time to avoid deprecation
             if now_vn.hour==21 and now_vn.minute<2 and last_daily!=now_vn.date():
                 last_daily=now_vn.date()
                 msg=f"📊 <b>BAO CAO NGAY {now_vn.strftime('%d/%m/%Y')} V10.1 FULL</b>\n"
