@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BOT V8.2 - FIX MASK TAX 3% + MEXC CONTRACT NOTIFY - MEXC <-> DEX arbitrage (PAPER)
+BOT V8.3 - DAILY HEARTBEAT 21h + CLEAN FORMAT - MEXC <-> DEX arbitrage (PAPER)
 Base: V8.0 user (decimals via RPC, risk buffer, adaptive, blacklist, telegram commands)
 + Fixes: WSOL for SOL native, LRU cache, strict symbol_ok, circuit breaker
 """
@@ -372,7 +372,6 @@ class MexcData:
                 new_status = {}
                 for ch, lst in tokens.items():
                     for t in lst:
-                        # V8.2: luu them contract de thong bao
                         new_status[(ch, t["dedup_key"])] = (t["withdraw_enable"], t["deposit_enable"], t["symbol"], t["contract"])
                 if self.status:
                     for k, vals in new_status.items():
@@ -380,30 +379,35 @@ class MexcData:
                         old = self.status.get(k)
                         if old:
                             ow, od = old[0], old[1]
-                            # Mo lai
+                            # Mo lai: tu ❌ -> ✅
                             if (not ow and w) or (not od and d):
-                                changes.append(f"MO LAI {sym} [{k[0]}] nap {'✅' if d else '❌'} rut {'✅' if w else '❌'}\nContract: {contract}")
-                            # Dong lai
+                                changes.append({"type": "open", "symbol": sym, "chain": k[0], "deposit": d, "withdraw": w, "contract": contract})
+                            # Dong lai: tu ✅ -> ❌
                             elif (ow and not w) or (od and not d):
-                                changes.append(f"DONG {sym} [{k[0]}] nap {'✅' if d else '❌'} rut {'✅' if w else '❌'}\nContract: {contract}")
+                                changes.append({"type": "close", "symbol": sym, "chain": k[0], "deposit": d, "withdraw": w, "contract": contract})
                 self.status = new_status
                 self.pairs, self.tokens, self.ts = pairs, tokens, now
             except Exception as e:
                 log.error("Lam moi MEXC loi: %s", e)
                 self.retry_after = now + 60
         if changes:
-            # V8.2: thong bao ca dong va mo, kem contract
-            open_msgs = []
-            close_msgs = []
-            for line in changes:
-                if "MO LAI" in line or "✅" in line:
-                    open_msgs.append(line)
-                else:
-                    close_msgs.append(line)
-            if open_msgs:
-                send_telegram("🔓 <b>MEXC vua MO LAI nap/rut</b>:\n" + "\n".join(esc(c) for c in open_msgs[:20]))
-            if close_msgs:
-                send_telegram("🔒 <b>MEXC vua DONG nap/rut</b>:\n" + "\n".join(esc(c) for c in close_msgs[:20]))
+            # V8.3: format moi theo yeu cau - contract copyable, icon ❌ cho dong
+            opens = [c for c in changes if c["type"] == "open"]
+            closes = [c for c in changes if c["type"] == "close"]
+            for item in opens[:10]:
+                dep_icon = "✅" if item["deposit"] else "❌"
+                wd_icon = "✅" if item["withdraw"] else "❌"
+                msg = (f"🔓 <b>MEXC Deposits & Withdrawals Reopened</b>\n\n"
+                       f"<b>{esc(item['symbol'])} [{item['chain']}]</b> — Deposit {dep_icon} | Withdrawal {wd_icon}\n\n"
+                       f"Contract: <code>{esc(item['contract'])}</code>")
+                send_telegram(msg)
+            for item in closes[:10]:
+                dep_icon = "✅" if item["deposit"] else "❌"
+                wd_icon = "✅" if item["withdraw"] else "❌"
+                msg = (f"🔒 <b>MEXC Deposits & Withdrawals Closed</b>\n\n"
+                       f"<b>{esc(item['symbol'])} [{item['chain']}]</b> — Deposit {dep_icon} | Withdrawal {wd_icon}\n\n"
+                       f"Contract: <code>{esc(item['contract'])}</code>")
+                send_telegram(msg)
     def get_book(self):
         with self.book_lock:
             if self.book and time.time() - self.book_ts < BOOK_TTL:
@@ -1071,39 +1075,60 @@ def send_telegram(text):
 def send_alert(chain_key, tok, pool, p):
     cfg = CHAINS[chain_key]
     if p["direction"] == "MEXC_TO_DEX":
-        action = f"MUA MEXC {tok['pair']} -> rut ve {chain_key} -> BAN tren DEX"
+        action = f"MUA MEXC → RUT {chain_key} → BAN DEX"
+        icon = "📤"
     else:
-        action = f"MUA tren {chain_key} DEX -> nap len MEXC -> BAN {tok['pair']}"
+        action = f"MUA DEX → NAP MEXC → BAN {tok['pair']}"
+        icon = "📥"
     bid, ask = p["mexc_best"]
-    tax_str = f"Tax: buy {p['buy_tax']*100:.1f}% / sell {p['sell_tax']*100:.1f}% | " if (p["buy_tax"] or p["sell_tax"]) else ""
-    en = ""
-    if p.get("withdraw_enable") is not None and p.get("deposit_enable") is not None:
-        en = f"Nap: {'✅' if p['deposit_enable'] else '❌'} Rut: {'✅' if p['withdraw_enable'] else '❌'} | "
+    thr = adaptive_threshold(chain_key)
+    
+    # Tax
+    if p["buy_tax"] or p["sell_tax"]:
+        tax_line = f"💸 Tax: Buy {p['buy_tax']*100:.1f}% / Sell {p['sell_tax']*100:.1f}%"
+    else:
+        tax_line = "💸 Tax: 0%"
+    
+    # Deposit/withdraw
+    en_line = f"🏦 Nap: {'✅' if p.get('deposit_enable') else '❌'} | Rut: {'✅' if p.get('withdraw_enable') else '❌'}"
+    
+    # Warning
     warn = []
     if not p.get("sec_known") and cfg.get("evm"):
-        warn.append("chua co du lieu security")
+        warn.append("chua co security data")
     if p.get("sec_soft"):
-        warn.append("co: " + ",".join(p["sec_soft"]))
-    warn_line = f"⚠ {esc('; '.join(warn))}\n" if warn else ""
-    thr = adaptive_threshold(chain_key)
-    msg = (f"{cfg['emoji']} <b>Arbitrage {esc(tok['symbol'])} [{chain_key}]</b> (paper) [{esc(p.get('real_source','?'))}]\n\n"
-           f"Contract: <code>{esc(tok['contract'])}</code>\n"
-           f"DEX: {esc(pool['dex'])} | {esc(pool['pair_name'])} | fee ~{pool['fee']*100:.2f}% | tuoi pool {pool.get('age_h',0):.0f}h\n"
-           f"Liq: ${pool['liq']:,.0f} | Vol24h: ${pool['vol24']:,.0f} | Txns1h: {pool['txns_h1']} | FDV ${pool.get('fdv',0):,.0f}\n"
-           f"Bien dong: 5m {pool.get('chg_m5',0):+.1f}% | 1h {pool.get('chg_h1',0):+.1f}%\n\n"
-           f"MEXC {esc(tok['pair'])}: bid/ask {fmt_price(bid)}/{fmt_price(ask)} | gia TB ${fmt_price(p['mexc_avg'])}\n"
-           f"DEX: gia DS ${fmt_price(pool['price'])} | gia thuc thi ${fmt_price(p['dex_exec'])} | impact ~{p['impact_dex']:.2f}%\n"
-           f"{tax_str}{en}Gross after tax {p['gross_after_tax']:.2f}%\n\n"
-           f"💰 <b>NET {p['net_pct']:.3f}% (${p['net_usd']:.2f})</b> | Gross {p['gross_pct']:.3f}%\n"
-           f"🛡 Net sau risk buffer: <b>{p['adj_net_pct']:.3f}%</b> (buffer {p['risk_buf']:.2f}%, nguong {thr:.2f}%)\n"
-           f"Von ${ORDER_SIZE_USD:.0f} | Token {fmt_token_amount(p['token_amount'])}"
-           f"{' -> '+fmt_token_amount(p['token_after_tax'])+' after tax' if 'token_after_tax' in p else ''}\n"
-           f"Gas ${p['gas']:.2f} | Phi rut ${p['withdraw_fee_usd']:.2f} | Phi MEXC {MEXC_TAKER_FEE*100:.2f}%\n"
-           f"{warn_line}🎯 {esc(action)}\n\n"
-           f"🔗 MEXC: https://www.mexc.com/exchange/{esc(tok['pair'])}\n"
-           f"🔗 DEX: {esc(pool['url'])}\n"
-           f"🔗 Explorer: {esc(cfg['explorer'] + tok['contract'])}\n\n"
-           f"⏰ {datetime.now().strftime('%H:%M:%S %d/%m')} | Gia co the doi, chuyen token mat ~{cfg['transfer_min']}+ phut.")
+        warn.append(",".join(p["sec_soft"]))
+    warn_line = f"⚠️ {'; '.join(warn)}\n" if warn else ""
+    
+    # Profit box
+    profit_emoji = "🟢" if p["adj_net_pct"] >= 2 else "🟡" if p["adj_net_pct"] >= 1 else "🔵"
+    
+    msg = (
+        f"{profit_emoji} <b>{esc(tok['symbol'])} [{chain_key}] {p['direction']}</b> | {esc(p.get('real_source','?'))} | {cfg['emoji']}\n"
+        f"{'─'*24}\n"
+        f"💰 <b>LAI {p['adj_net_pct']:.2f}% (${p['net_usd']:.2f})</b> sau buffer | NET {p['net_pct']:.2f}%\n"
+        f"📈 Gross {p['gross_pct']:.2f}% → Sau tax {p['gross_after_tax']:.2f}% | Impact {p['impact_dex']:.2f}%\n"
+        f"🛡️ Buffer {p['risk_buf']:.2f}% | Nguong {thr:.2f}%\n"
+        f"{'─'*24}\n"
+        f"{tax_line} | {en_line}\n"
+        f"💵 Von ${ORDER_SIZE_USD:.0f} | Token {fmt_token_amount(p['token_amount'])}\n"
+        f"⛽ Gas ${p['gas']:.2f} | Rut ${p['withdraw_fee_usd']:.2f} | Phi MEXC {MEXC_TAKER_FEE*100:.2f}%\n"
+        f"{'─'*24}\n"
+        f"🏦 <b>MEXC {esc(tok['pair'])}</b>\n"
+        f"   Bid {fmt_price(bid)} / Ask {fmt_price(ask)} → TB ${fmt_price(p['mexc_avg'])}\n"
+        f"🦄 <b>{esc(pool['dex'])} {esc(pool['pair_name'])}</b>\n"
+        f"   DS ${fmt_price(pool['price'])} → Thuc thi ${fmt_price(p['dex_exec'])}\n"
+        f"   💧 ${pool['liq']:,.0f} | Vol ${pool['vol24']:,.0f} | Tx1h {pool['txns_h1']} | Tuoi {pool.get('age_h',0):.0f}h\n"
+        f"   Bien dong 5m {pool.get('chg_m5',0):+.1f}% | 1h {pool.get('chg_h1',0):+.1f}%\n"
+        f"{'─'*24}\n"
+        f"{warn_line}"
+        f"{icon} <b>{esc(action)}</b>\n\n"
+        f"📜 Contract: <code>{esc(tok['contract'])}</code>\n"
+        f"🔗 <a href='https://www.mexc.com/exchange/{esc(tok['pair'])}'>MEXC</a> | "
+        f"<a href='{esc(pool['url'])}'>DEX</a> | "
+        f"<a href='{esc(cfg['explorer'] + tok['contract'])}'>Explorer</a>\n"
+        f"⏰ {datetime.now().strftime('%H:%M %d/%m')} | Chuyen ~{cfg['transfer_min']} phut | Gia thay doi nhanh!"
+    )
     return send_telegram(msg)
 
 def summary_text(limit=12):
@@ -1302,20 +1327,37 @@ class Worker:
         self.start()
 
 def heartbeat_loop():
+    last_sent = None
     while True:
-        time.sleep(1800)
         try:
-            msg = (f"💓 <b>HEARTBEAT {datetime.now().strftime('%H:%M %d/%m')}</b>\nOrder ${ORDER_SIZE_USD:.0f} | "
-                   f"RealCheck={REAL_PRICE_CHECK} | RequireReal={REQUIRE_REAL_PRICE}\n\n")
-            for k, st in STATS.items():
-                s = st.snapshot()
-                msg += (f"{CHAINS[k]['emoji']} {k}: try={s['attempted']} fetch={s['fetched']} opp={s['opportunity']} "
-                        f"sig={s['signals']} sus={s['suspect']} realOK={s['real_price_ok']} realFail={s['real_price_fail']} "
-                        f"bl={s['blacklisted_skip']} err={s['errors']} thr={adaptive_threshold(k):.2f}\n")
-            msg += "\nAPI: " + esc(API.line()) + "\n\n" + summary_text(8)
-            send_telegram(msg)
-        except:
-            log.exception("Heartbeat loi")
+            # VN time = UTC+7
+            now_utc = datetime.utcnow()
+            now_vn = now_utc + __import__("datetime").timedelta(hours=7)
+            # 21:00 VN
+            if now_vn.hour == 21 and now_vn.minute < 2:
+                today = now_vn.date()
+                if last_sent != today:
+                    msg = (f"📊 <b>BAO CAO NGAY {now_vn.strftime('%d/%m/%Y')} - 21:00</b>\n"
+                           f"Von: ${ORDER_SIZE_USD:.0f} | Real: {REAL_PRICE_CHECK} | Require: {REQUIRE_REAL_PRICE}\n"
+                           f"{'─'*20}\n")
+                    total_sig = 0
+                    for k, st in STATS.items():
+                        s = st.snapshot()
+                        if s['attempted'] == 0:
+                            continue
+                        total_sig += s['signals']
+                        thr = adaptive_threshold(k)
+                        msg += (f"{CHAINS[k]['emoji']} <b>{k}</b>: "
+                                f"Quet {s['attempted']} | Loc {s['fetched']} | Co hoi {s['opportunity']} | "
+                                f"✅ {s['signals']} | Sus {s['suspect']}\n"
+                                f"   RealOK {s['real_price_ok']} | Fail {s['real_price_fail']} | Thr {thr:.2f}%\n")
+                    msg += f"\n{'─'*20}\nAPI: {esc(API.line())}\n\n{summary_text(8)}"
+                    send_telegram(msg)
+                    last_sent = today
+            time.sleep(60)
+        except Exception as e:
+            log.exception("Heartbeat loi: %s", e)
+            time.sleep(60)
 
 def cleanup():
     now = time.time()
