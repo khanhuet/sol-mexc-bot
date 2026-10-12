@@ -412,9 +412,13 @@ class BybitEx(Exchange):
                 log.warning("Bybit parse fail %s", e)
         # Fallback: use tickers
         log.warning("Bybit instruments fail, fallback to tickers")
-        r=http_get(f"{BYBIT_BASE}/v5/market/tickers",params={"category":"spot"},limiter=BYBIT_LIMITER,timeout=20)
+        # Try 2 endpoints
+        for url in [f"{BYBIT_BASE}/v5/market/tickers", f"https://api.bybit.com/v5/market/tickers"]:
+            r=http_get(url,params={"category":"spot"},limiter=BYBIT_LIMITER,timeout=20)
+            if r and r.status_code==200:
+                break
         if not r or r.status_code!=200:
-            log.warning("Bybit tickers fail %s", r.status_code if r else "no response")
+            log.warning("Bybit tickers fail %s (Render IP bi chan, se giu data cu)", r.status_code if r else "no response")
             return {}
         out={}
         try:
@@ -424,20 +428,15 @@ class BybitEx(Exchange):
         except Exception as e:
             log.warning("Bybit tickers parse %s", e)
         return out
-        out={}
-        try:
-            for s in r.json().get("result",{}).get("list",[]):
-                if s.get("quoteCoin")=="USDT" and s.get("status")=="Trading": out[f"{s.get('baseCoin')}USDT"]=s.get("baseCoin")
-        except Exception as e: log.warning("Bybit pairs %s",e)
-        return out
     def load_networks(self,pairs):
         # Bybit coin info needs auth, try signed, fallback to minimal using pairs only
         base_set=set(pairs.values()); sym2pair={v:k for k,v in pairs.items()}
         r=bybit_signed_get("/v5/asset/coin/query-info")
         if not r or r.status_code!=200:
+            if ALLOW_UNVERIFIED_STATUS:
+                log.warning("Bybit no key, dung unverified listings")
+                return unverified_listings("BYBIT", pairs)
             log.warning("Bybit no key, dung public minimal - nap/rut assume ✅")
-            # Return minimal entries without contract (will be filtered later, but still allow price scanning via book)
-            # For DEX matching we need contract, so we skip networks here, but MultiData will still have other CEX contracts
             return []
         out,seen=[],set()
         try:
@@ -498,13 +497,12 @@ class BinanceEx(Exchange):
         except Exception as e:
             log.warning("Binance parse %s", e)
         return out
-        out={}
-        for s in r.json().get("symbols",[]):
-            if s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING": out[s["symbol"]]=s["baseAsset"]
-        return out
     def load_networks(self,pairs):
         r=binance_signed_get("/sapi/v1/capital/config/getall")
         if not r or r.status_code!=200:
+            if ALLOW_UNVERIFIED_STATUS:
+                log.warning("Binance no key, dung unverified listings")
+                return unverified_listings("BINANCE", pairs)
             log.warning("Binance no key, skip networks"); return []
         base_set=set(pairs.values()); sym2pair={v:k for k,v in pairs.items()}
         out,seen=[],set()
