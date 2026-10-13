@@ -24,7 +24,7 @@ from urllib.parse import urlencode, quote as urlquote
 from zoneinfo import ZoneInfo
 import requests
 
-VERSION = "V11.5"
+VERSION = "V11.6"
 try: VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 except Exception: VN_TZ = timezone(timedelta(hours=7))
 
@@ -232,6 +232,11 @@ def http_req(method, url, params=None, headers=None, json_body=None, limiter=Non
             if limiter: limiter.wait()
             with GLOBAL_SEM:
                 r = session().request(method, url, params=params, headers=h, json=json_body, timeout=timeout)
+            if r.status_code == 418:     # Binance: IP bi cam tam thoi
+                try: wait = float(r.headers.get("Retry-After", 1800))
+                except Exception: wait = 1800
+                with BACKOFF_LOCK: BACKOFF[host] = time.time() + min(max(wait, 300), 7200)
+                log.warning("418 tu %s -> IP bi cam tam thoi, tam dung %.0f phut", host, min(max(wait, 300), 7200) / 60); return r
             if r.status_code == 429:
                 try: wait = float(r.headers.get("Retry-After", 10))
                 except Exception: wait = 10
@@ -268,6 +273,7 @@ def http_err(r, what):
     if r is None: return RuntimeError(f"{what}: no response / timeout")
     hint = ""
     if r.status_code in (403, 451): hint = " (server IP may be geo-blocked by the exchange)"
+    if r.status_code == 418: hint = " (server IP temporarily banned by the exchange for too many requests - auto retry later)"
     return RuntimeError(f"{what}: HTTP {r.status_code}{hint}")
 
 def esc(s): return html.escape(str(s), quote=False)
@@ -917,22 +923,27 @@ class MultiData:
         if not self.refresh_lock.acquire(blocking=False): return
         events = []
         try:
-            if now - self.fut_ts > 3600: self._load_futures(); self.fut_ts = now
+            if now - self.fut_ts > 3600 and self.by_chain:      # futures: tai nen, sau khi da co du lieu chinh
+                self.fut_ts = now; threading.Thread(target=self._load_futures, daemon=True, name="Futures").start()
             def load(name):
                 ex = EXCHANGES[name]; t0 = time.time()
                 pairs = ex.load_pairs()
                 if not pairs: raise RuntimeError("0 USDT pairs")
                 toks = ex.load_networks(pairs)
                 return name, pairs, toks, time.time() - t0
-            with ThreadPoolExecutor(max_workers=max(1, REFRESH_WORKERS)) as pool:
-                futs = {n: pool.submit(load, n) for n in EXCHANGES}
-                for n, f in futs.items():
+            from concurrent.futures import as_completed, TimeoutError as FTimeout
+            pool = ThreadPoolExecutor(max_workers=max(1, REFRESH_WORKERS))
+            futs = {pool.submit(load, n): n for n in EXCHANGES}; done = set()
+            try:
+                for f in as_completed(futs, timeout=900):
+                    n = futs[f]; done.add(n)
                     h = self.health.setdefault(n, {"ok": False, "err": "", "pairs": 0, "listings": 0, "verified": False, "fail_since": None})
                     try:
-                        name, pairs, toks, dt = f.result(timeout=240)
+                        name, pairs, toks, dt = f.result()
                     except Exception as e:
-                        h.update(ok=False, err=str(e)[:200]); h["fail_since"] = h["fail_since"] or time.time()
-                        log.error("Lam moi %s loi: %s", n, e)
+                        msg = str(e) or type(e).__name__
+                        h.update(ok=False, err=msg[:200]); h["fail_since"] = h["fail_since"] or time.time()
+                        log.error("Lam moi %s loi: %s", n, msg)
                         if time.time() - h["fail_since"] > 1800: error_alert(f"cex:{n}", f"<b>{n}</b> failing for >30 min: {esc(h['err'])}")
                         continue
                     verified = toks is not None
@@ -941,6 +952,16 @@ class MultiData:
                     events += self._diff_status(n, toks)
                     with self.lock: self.tokens[n] = toks; self.tok_ts[n] = time.time()
                     log.info("%s: %d cap, %d token-mang (%.1fs)%s", n, len(pairs), len(toks), dt, "" if verified else " [KHONG CO DU LIEU MANG]")
+                    del pairs, toks
+                    self._build(); self.first_done.set()          # quet ngay voi cac san da tai xong
+                    gc.collect()
+            except FTimeout:
+                for f, n in futs.items():
+                    if n not in done:
+                        h = self.health.setdefault(n, {"ok": False, "err": "", "pairs": 0, "listings": 0, "verified": False, "fail_since": None})
+                        h.update(ok=False, err="timeout (>15 min) - server too slow?"); log.error("Lam moi %s: timeout", n)
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
             if not any(h["ok"] for h in self.health.values()) and not self.by_chain:
                 self.retry_after = time.time() + 60; return
             self._build()
@@ -1723,7 +1744,7 @@ def refresher_loop():
 class Worker:
     def __init__(self): self.stop = None; self.thread = None
     def start(self):
-        self.stop = threading.Event(); SCAN_HEALTH["last_batch"] = time.time()
+        self.stop = threading.Event(); SCAN_HEALTH["last_batch"] = SCAN_HEALTH["last_batch"] or time.time()
         self.thread = threading.Thread(target=dex_scheduler_loop, args=(self.stop,), daemon=True, name="DexScan"); self.thread.start()
     def restart(self):
         if self.stop: self.stop.set()
@@ -1897,7 +1918,8 @@ def handle_command(text):
             L.append("     by exchange: " + ", ".join(f"{c} {n}" for c, n in src.most_common(5)))
             L.append(f"     {s.get('pools',0)} pools seen · {s.get('candidates',0)} candidates · {s.get('signals',0)} signals · last scan {ago}s ago")
         L.append(f"\nMemory: {rss_mb():.0f} MB (Render Free limit 512 MB)")
-        L.append(f"Scanner: {SCAN_HEALTH['cycle']} batches done · last batch {int(time.time() - SCAN_HEALTH['last_batch'])}s ago · eval queue {len(INFLIGHT)}")
+        lb = f"{int(time.time() - SCAN_HEALTH['last_batch'])}s ago" if SCAN_HEALTH["last_batch"] else "not started (loading exchange data...)"
+        L.append(f"Scanner: {SCAN_HEALTH['cycle']} batches done · last batch {lb} · eval queue {len(INFLIGHT)}")
         tot = DB.q("SELECT COUNT(*) FROM signals WHERE ts>?", (time.time() - 86400,), one=True)[0]
         L.append(f"Signals sent (24h): {tot}")
         L.append("API: " + esc(API.line())); return "\n".join(L)
@@ -2028,7 +2050,10 @@ def cleanup():
 
 STARTUP_MARK = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)) or ".", ".startup_sent")
 def startup_report():
-    MULTI.first_done.wait(timeout=240)
+    MULTI.first_done.wait(timeout=900)
+    for _ in range(120):                       # cho lan tai dau tien cua tat ca san xong (toi da 10 phut)
+        if not MULTI.refresh_lock.locked(): break
+        time.sleep(5)
     try:
         if time.time() - os.path.getmtime(STARTUP_MARK) < 6 * 3600: log.info("Bo qua tin khoi dong (da gui trong 6h)"); return
     except OSError: pass
