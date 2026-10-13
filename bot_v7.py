@@ -16,7 +16,7 @@ Quy trinh moi token:
  7. Xac nhan lai sau vai giay -> bao Telegram day du
 Bao cao: chi 1 lan/ngay luc 21:00 (UTC+7). Canh bao loi he thong: toi da 1 lan / 6h moi loai.
 """
-import base64, hashlib, hmac, html, json, logging, math, os, re, sqlite3, sys, threading, time
+import gc, base64, hashlib, hmac, html, json, logging, math, os, re, sqlite3, sys, threading, time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -24,7 +24,7 @@ from urllib.parse import urlencode, quote as urlquote
 from zoneinfo import ZoneInfo
 import requests
 
-VERSION = "V11.3"
+VERSION = "V11.5"
 try: VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 except Exception: VN_TZ = timezone(timedelta(hours=7))
 
@@ -103,7 +103,8 @@ EXTRA_SLIPPAGE = env_float("EXTRA_SLIPPAGE", 0.003)         # du phong truot gia
 ALLOW_INFERRED_CONTRACT = env_bool("ALLOW_INFERRED_CONTRACT", "1")  # ghep san khong cong bo contract theo symbol (chi khi duy nhat)
 ALLOW_UNVERIFIED_STATUS = env_bool("ALLOW_UNVERIFIED_STATUS", "0")  # cho phep trang thai nap/rut chua xac minh
 CONFIRM_DELAY = env_float("CONFIRM_DELAY", 2.0); COOLDOWN_MIN = env_float("COOLDOWN_MIN", 30)
-SCAN_PAUSE_SEC = env_float("SCAN_PAUSE_SEC", 20); STATIC_TTL = env_float("STATIC_TTL", 180); STALE_MAX = env_float("STALE_MAX", 900)
+SCAN_PAUSE_SEC = env_float("SCAN_PAUSE_SEC", 20); STATIC_TTL = env_float("STATIC_TTL", 300); STALE_MAX = env_float("STALE_MAX", 1500)
+REFRESH_WORKERS = env_int("REFRESH_WORKERS", 2)   # tai du lieu 2 san cung luc (thay vi 10) -> giam dinh RAM
 STATUS_CONFIRM = env_int("STATUS_CONFIRM", 2)               # trang thai nap/rut phai giu 2 lan lam moi lien tiep moi bao
 STATUS_NOTIFY = env_bool("STATUS_NOTIFY", "1"); STATUS_MAX_LINES = env_int("STATUS_MAX_LINES", 40)
 STUCK_SEC = env_float("STUCK_SEC", 900); BOOK_TTL = 10; DEX_BATCH = 30
@@ -923,12 +924,12 @@ class MultiData:
                 if not pairs: raise RuntimeError("0 USDT pairs")
                 toks = ex.load_networks(pairs)
                 return name, pairs, toks, time.time() - t0
-            with ThreadPoolExecutor(max_workers=len(EXCHANGES)) as pool:
+            with ThreadPoolExecutor(max_workers=max(1, REFRESH_WORKERS)) as pool:
                 futs = {n: pool.submit(load, n) for n in EXCHANGES}
                 for n, f in futs.items():
                     h = self.health.setdefault(n, {"ok": False, "err": "", "pairs": 0, "listings": 0, "verified": False, "fail_since": None})
                     try:
-                        name, pairs, toks, dt = f.result(timeout=150)
+                        name, pairs, toks, dt = f.result(timeout=240)
                     except Exception as e:
                         h.update(ok=False, err=str(e)[:200]); h["fail_since"] = h["fail_since"] or time.time()
                         log.error("Lam moi %s loi: %s", n, e)
@@ -944,15 +945,17 @@ class MultiData:
                 self.retry_after = time.time() + 60; return
             self._build()
         finally:
+            gc.collect()
             self.refresh_lock.release(); self.first_done.set()
         if events: handle_status_events(events)
     def _load_futures(self):
         def lf(ex):
             try: return ex.name, ex.load_futures()
             except Exception as e: log.debug("%s futures loi %s", ex.name, e); return ex.name, None
-        with ThreadPoolExecutor(max_workers=len(EXCHANGES)) as pool:
-            for name, fut in pool.map(lf, EXCHANGES.values()):
-                if fut: EXCHANGES[name].futures = {x.upper() for x in fut if x}
+        for ex in EXCHANGES.values():          # tuan tu: cac file futures rat lon, tai song song de tran RAM
+            name, fut = lf(ex)
+            if fut: EXCHANGES[name].futures = {x.upper() for x in fut if x}
+            gc.collect()
     def _diff_status(self, name, toks):
         """Chong nhay trang thai: chi bao khi trang thai moi giu nguyen STATUS_CONFIRM lan lam moi lien tiep."""
         ev = []; st = self.stable.setdefault(name, {}); cd = self.cand.setdefault(name, {}); first = not st
@@ -1893,7 +1896,11 @@ def handle_command(text):
             src = Counter(l["cex"] for e in ents for l in e["listings"])
             L.append("     by exchange: " + ", ".join(f"{c} {n}" for c, n in src.most_common(5)))
             L.append(f"     {s.get('pools',0)} pools seen · {s.get('candidates',0)} candidates · {s.get('signals',0)} signals · last scan {ago}s ago")
-        L.append("\nAPI: " + esc(API.line())); return "\n".join(L)
+        L.append(f"\nMemory: {rss_mb():.0f} MB (Render Free limit 512 MB)")
+        L.append(f"Scanner: {SCAN_HEALTH['cycle']} batches done · last batch {int(time.time() - SCAN_HEALTH['last_batch'])}s ago · eval queue {len(INFLIGHT)}")
+        tot = DB.q("SELECT COUNT(*) FROM signals WHERE ts>?", (time.time() - 86400,), one=True)[0]
+        L.append(f"Signals sent (24h): {tot}")
+        L.append("API: " + esc(API.line())); return "\n".join(L)
     if cmd == "/check": return cmd_check(arg) if arg else "Usage: /check SYMBOL"
     if cmd == "/report": daily_report(); return "Report sent."
     if cmd == "/networks":
@@ -1934,12 +1941,18 @@ def handle_command(text):
     return "Unknown command. /help"
 def telegram_poll_loop():
     offset = None; c409 = [0]
+    try:   # webhook cu (tu bot khac / ban cu) lam getUpdates bi 409 -> go bo
+        r = session().post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook", data={"drop_pending_updates": "false"}, timeout=15)
+        log.info("Telegram deleteWebhook: %s", r.text[:120])
+        me = session().get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe", timeout=15).json().get("result", {})
+        log.info("Telegram bot: @%s", me.get("username"))
+    except Exception as e: log.warning("deleteWebhook loi: %s", e)
     while True:
         try:
             r = session().get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates", params={"timeout": 25, "offset": offset}, timeout=35)
             if r.status_code == 409:
                 c409[0] += 1
-                if c409[0] in (1, 20) or c409[0] % 120 == 0: log.warning("Telegram 409: ANOTHER instance is polling this bot token (old service / PC?). Commands may not work until it is stopped.")
+                if c409[0] in (1, 20) or c409[0] % 120 == 0: log.warning("Telegram 409: ANOTHER instance is polling this bot token (old Render service / PC / other host). Telegram commands will NOT work until it is stopped. Alerts still send. Detail: %s", r.text[:150])
                 time.sleep(30); continue
             if r.status_code != 200: time.sleep(10); continue
             c409[0] = 0
@@ -1964,8 +1977,15 @@ def start_web():
         socketserver.TCPServer(("0.0.0.0", PORT), H).serve_forever(); return
     app = Flask(__name__)
     def authed(): return bool(ADMIN_TOKEN) and hmac.compare_digest(request.args.get("token") or "", ADMIN_TOKEN)
+    def plain(txt): return (html.unescape(_TAG_RE.sub("", txt)), 200, {"Content-Type": "text/plain; charset=utf-8"})
     @app.route("/")
-    def home(): return f"{VERSION} CEX-DEX bot OK"
+    def home():
+        try: return plain(handle_command("/status"))
+        except Exception as e: return plain(f"{VERSION} running (status error: {e})")
+    @app.route("/check/<sym>")
+    def check(sym): return plain(cmd_check(sym.upper()))
+    @app.route("/config")
+    def config(): return plain(handle_command("/config"))
     @app.route("/health")
     def health(): return "OK", 200
     @app.route("/signals")
@@ -1986,6 +2006,12 @@ def keepalive_loop():
         try: requests.get(url.rstrip("/") + "/health", timeout=20)
         except Exception as e: log.debug("keepalive loi %s", e)
 
+def rss_mb():
+    try:
+        for line in open("/proc/self/status"):
+            if line.startswith("VmRSS:"): return int(line.split()[1]) / 1024
+    except Exception: pass
+    return 0.0
 def cleanup():
     now = time.time()
     with CD_LOCK:
@@ -1994,6 +2020,11 @@ def cleanup():
         for k in [k for k, v in FIRST_SEEN.items() if now - v[1] > 3600]: FIRST_SEEN.pop(k, None)
     with BL_LOCK:
         for k in [k for k, u in BL.items() if u < now]: BL.pop(k, None)
+    with IF_LOCK:
+        for k in [k for k, t in LAST_EVAL.items() if now - t > 3600]: LAST_EVAL.pop(k, None)
+    with SEC_LOCK:
+        for k in [k for k, (t, _) in SEC_CACHE.items() if now - t > 6 * 3600]: SEC_CACHE.pop(k, None)
+    gc.collect()
 
 STARTUP_MARK = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)) or ".", ".startup_sent")
 def startup_report():
@@ -2034,7 +2065,7 @@ def main():
     MULTI.first_done.wait(timeout=240)
     w = Worker(); w.start()
     while True:
-        time.sleep(120); cleanup()
+        time.sleep(120); cleanup(); log.info("RAM %.0f MB | batches %d", rss_mb(), SCAN_HEALTH["cycle"])
         if not w.thread.is_alive() or time.time() - SCAN_HEALTH["last_batch"] > STUCK_SEC:
             log.warning("[SUPERVISOR] khoi dong lai luong quet"); w.restart()
 
