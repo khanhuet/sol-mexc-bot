@@ -24,7 +24,7 @@ from urllib.parse import urlencode, quote as urlquote
 from zoneinfo import ZoneInfo
 import requests
 
-VERSION = "V11.2"
+VERSION = "V11.3"
 try: VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 except Exception: VN_TZ = timezone(timedelta(hours=7))
 
@@ -108,7 +108,7 @@ STATUS_CONFIRM = env_int("STATUS_CONFIRM", 2)               # trang thai nap/rut
 STATUS_NOTIFY = env_bool("STATUS_NOTIFY", "1"); STATUS_MAX_LINES = env_int("STATUS_MAX_LINES", 40)
 STUCK_SEC = env_float("STUCK_SEC", 900); BOOK_TTL = 10; DEX_BATCH = 30
 DAILY_REPORT_HOUR = env_int("DAILY_REPORT_HOUR", 21)
-ERROR_ALERTS = env_bool("ERROR_ALERTS", "1"); ERROR_ALERT_EVERY_H = env_float("ERROR_ALERT_EVERY_H", 6)
+ERROR_ALERTS = env_bool("ERROR_ALERTS", "0"); ERROR_ALERT_EVERY_H = env_float("ERROR_ALERT_EVERY_H", 6)   # mac dinh TAT: loi chi hien trong /status va Daily Report
 EXCLUDE_SYMBOLS = {s.strip().upper() for s in env_str("EXCLUDE_SYMBOLS", "USDT,USDC,USDE,DAI,FDUSD,TUSD,BUSD,PYUSD,USD1,USDD,USDP,EURC,USDS,USDT0").split(",") if s.strip()}
 BAD_STREAK_BLACKLIST = env_int("BAD_STREAK_BLACKLIST", 3); BLACKLIST_HOURS = env_float("BLACKLIST_HOURS", 24)
 FOLLOWUP_MIN = (5, 15)
@@ -1633,51 +1633,100 @@ def process(ch, results, tag=""):
         if send_telegram(build_alert(ch, tok, pool, p2, tag)):
             with CD_LOCK: COOLDOWN[key] = (time.time(), p2["net_pct"])
             STATS[ch].inc("signals"); DB.insert(ch, tok, pool, p2)
-def scan_chain_once(ch, stop):
-    st = STATS[ch]; MULTI.ensure(); entries = MULTI.by_chain.get(ch, [])
-    if not entries: return False
-    need = {l["cex"] for e in entries for l in e["listings"]}
-    books = {n: EXCHANGES[n].get_book() for n in need}
-    for i in range(0, len(entries), DEX_BATCH):
-        if stop.is_set() or ch in PAUSED: return True
-        st.beat(); chunk = entries[i:i + DEX_BATCH]
-        pools = fetch_dex_pools(ch, [e["contract"] for e in chunk])
-        if pools is None: st.inc("errors"); stop.wait(3); continue
-        cands = []
-        for e in chunk:
-            pool = pools.get(e["key"])
-            if not pool: continue
-            st.inc("pools")
-            for tok in e["listings"]:
-                st.inc("scanned")
-                if not symbol_ok(tok["symbol"], pool["dex_symbol"]): st.inc("contract_skip"); continue
-                if is_blacklisted(ch, tok): continue
-                if prefilter(tok, pool, books.get(tok["cex"]) or {}): cands.append((tok, pool))
-        if cands:
-            st.inc("candidates", len(cands))
-            with ThreadPoolExecutor(max_workers=3) as pool_ex:
-                res = [x for lst in pool_ex.map(lambda c: check_candidate(ch, c[0], c[1]), cands) for x in lst]
+# ---------------- BO LAP LICH QUET DUY NHAT (thay cho 11 luong quet song song) ----------------
+# Ly do: 11 luong cung goi DexScreener -> vuot gioi han -> 429 -> ca bot dung. Gio chi 1 luong goi DexScreener,
+# toc do co dinh (DEX_RPM), uu tien token "nong" (dang co chenh lech), token khong co pool dat loc thi it quet lai.
+DEX_RPM = env_float("DEX_RPM", 50)                      # so request DexScreener / phut (gioi han chinh thuc 300, IP Render dung chung -> de thap)
+HOT_SEC = env_float("HOT_SEC", 60); WARM_SEC = env_float("WARM_SEC", 180); COLD_SEC = env_float("COLD_SEC", 1200)
+TSTATE = {}; TS_LOCK = threading.Lock()                 # (chain, key) -> {"next": ts, "tier": str}
+EVAL_POOL = ThreadPoolExecutor(max_workers=3, thread_name_prefix="Eval"); INFLIGHT = set(); IF_LOCK = threading.Lock()
+SCAN_HEALTH = {"last_batch": 0.0, "cycle": 0}
+def entry_active(e):
+    """Chi quet token co it nhat 1 san dang mo nap hoac rut (va co gia tren san)."""
+    return any(status_ok(l.get("deposit_enable")) or (status_ok(l.get("withdraw_enable")) and l.get("withdraw_fee") is not None) for l in e["listings"])
+def pick_batch():
+    """Chon chain + toi da DEX_BATCH token den han, uu tien hot > warm > cold, chain lau chua quet nhat."""
+    now = time.time(); best = None
+    for ch, ents in MULTI.by_chain.items():
+        if ch in PAUSED or not ents: continue
+        due = []
+        with TS_LOCK:
+            for e in ents:
+                stt = TSTATE.get((ch, e["key"]))
+                nxt = stt["next"] if stt else 0
+                if nxt <= now and entry_active(e): due.append((0 if (stt or {}).get("tier") == "hot" else 1 if (stt or {}).get("tier") == "warm" else 2, nxt, e))
+        if not due: continue
+        due.sort(key=lambda x: (x[0], x[1])); score = (due[0][0], STATS[ch].last_scan)
+        if best is None or score < best[0]: best = (score, ch, [x[2] for x in due[:DEX_BATCH]])
+    return (best[1], best[2]) if best else (None, [])
+def set_tier(ch, key, tier):
+    delay = {"hot": HOT_SEC, "warm": WARM_SEC, "cold": COLD_SEC}[tier]
+    with TS_LOCK: TSTATE[(ch, key)] = {"tier": tier, "next": time.time() + delay * (0.8 + 0.4 * (hash(key) % 100) / 100)}
+LAST_EVAL = {}; EVAL_COOLDOWN = env_float("EVAL_COOLDOWN", 90)
+def eval_async(ch, tok, pool):
+    k = (ch, tok["cex"], tok["key"])
+    with IF_LOCK:
+        if k in INFLIGHT or time.time() - LAST_EVAL.get(k, 0) < EVAL_COOLDOWN: return   # khong quote lai cung token qua day
+        INFLIGHT.add(k); LAST_EVAL[k] = time.time()
+    def job():
+        try:
+            res = check_candidate(ch, tok, pool)
             if res: process(ch, res)
+        finally:
+            with IF_LOCK: INFLIGHT.discard(k)
+    EVAL_POOL.submit(job)
+def gap_estimate(tok, pool, book):
+    bt = book.get(tok["cex_pair"])
+    if not bt: return None
+    mult = unit_mult(tok["symbol"], pool["dex_symbol"]); bid, ask = bt[0] / mult, bt[1] / mult
+    return max((pool.get("price_max", pool["price"]) / ask - 1) * 100, (bid / pool.get("price_min", pool["price"]) - 1) * 100)
+def scan_batch(ch, chunk):
+    st = STATS[ch]; st.beat()
+    pools = fetch_dex_pools(ch, [e["contract"] for e in chunk])
+    if pools is None:
+        for e in chunk: set_tier(ch, e["key"], "warm")    # loi API: thu lai sau, khong danh dau cold
+        st.inc("errors"); return
+    books = {n: EXCHANGES[n].get_book() for n in {l["cex"] for e in chunk for l in e["listings"]}}
+    for e in chunk:
+        pool = pools.get(e["key"])
+        if not pool: set_tier(ch, e["key"], "cold"); continue
+        st.inc("pools"); best_gap = -99
+        for tok in e["listings"]:
+            st.inc("scanned")
+            if not symbol_ok(tok["symbol"], pool["dex_symbol"]): st.inc("contract_skip"); continue
+            if is_blacklisted(ch, tok): continue
+            g = gap_estimate(tok, pool, books.get(tok["cex"]) or {})
+            if g is not None: best_gap = max(best_gap, g)
+            if prefilter(tok, pool, books.get(tok["cex"]) or {}): st.inc("candidates"); eval_async(ch, tok, pool)
+        set_tier(ch, e["key"], "hot" if best_gap >= MIN_NET_PCT * 0.4 else "warm")
     st.last_scan = time.time()
-    return True
-def run_chain(ch, stop):
-    log.info("[%s] bat dau", ch); empty = 0
+def dex_scheduler_loop(stop):
+    log.info("Bo lap lich quet: %.0f request DexScreener/phut", DEX_RPM)
+    gap = 60.0 / max(DEX_RPM, 1)
     while not stop.is_set():
         try:
-            STATS[ch].beat()
-            if not scan_chain_once(ch, stop): empty += 1; stop.wait(60 if empty < 10 else 300); continue
-            empty = 0; stop.wait(SCAN_PAUSE_SEC)
-        except Exception: STATS[ch].inc("errors"); log.exception("[%s] loi vong quet", ch); stop.wait(20)
+            with BACKOFF_LOCK: wait = BACKOFF.get("api.dexscreener.com", 0) - time.time()
+            if wait > 0: stop.wait(wait + 1); continue          # dang bi gioi han -> cho, KHONG tinh la loi API
+            ch, chunk = pick_batch()
+            if not ch: stop.wait(3); continue
+            t0 = time.time(); scan_batch(ch, chunk); SCAN_HEALTH["last_batch"] = time.time(); SCAN_HEALTH["cycle"] += 1
+            stop.wait(max(0.0, gap - (time.time() - t0)))
+        except Exception: log.exception("loi bo lap lich"); stop.wait(10)
+def refresher_loop():
+    while True:
+        try: MULTI.ensure()
+        except Exception: log.exception("refresh loi")
+        time.sleep(20)
 class Worker:
-    def __init__(self, ch): self.ch = ch; self.stop = None; self.thread = None
+    def __init__(self): self.stop = None; self.thread = None
     def start(self):
-        self.stop = threading.Event(); STATS[self.ch].beat()
-        self.thread = threading.Thread(target=run_chain, args=(self.ch, self.stop), daemon=True, name=f"Scan-{self.ch}"); self.thread.start()
+        self.stop = threading.Event(); SCAN_HEALTH["last_batch"] = time.time()
+        self.thread = threading.Thread(target=dex_scheduler_loop, args=(self.stop,), daemon=True, name="DexScan"); self.thread.start()
     def restart(self):
         if self.stop: self.stop.set()
         if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=5)
-            if self.thread.is_alive(): log.warning("[%s] vong cu chua thoat, cho lan sau", self.ch); return
+            self.thread.join(timeout=10)
+            if self.thread.is_alive(): log.warning("luong quet cu chua thoat"); return
         self.start()
 
 # ============================ SU KIEN NAP / RUT ============================
@@ -1798,9 +1847,6 @@ def scheduler_loop():
             now = datetime.now(VN_TZ)
             if now.hour == DAILY_REPORT_HOUR and now.minute < 5 and last != now.date():
                 last = now.date(); daily_report()
-            for k, st in STATS.items():
-                if st.last_scan and time.time() - st.last_scan > 3600:
-                    error_alert(f"stuck:{k}", f"Chain {k} has not completed a scan in the last hour.")
         except Exception: log.exception("scheduler loi")
 
 # ============================ LENH TELEGRAM ============================
@@ -1840,7 +1886,13 @@ def handle_command(text):
         L = [f"<b>STATUS {VERSION}</b> {datetime.now(VN_TZ).strftime('%H:%M %d/%m')}"] + cex_health_lines() + [""]
         for k, st in STATS.items():
             s = st.snapshot(daily=True); ago = int(time.time() - st.last_scan) if st.last_scan else -1
-            L.append(f"{CHAINS[k]['emoji']} {k}{' (PAUSED)' if k in PAUSED else ''}: tokens {len(MULTI.by_chain.get(k, []))} · pools {s.get('pools',0)} · candidates {s.get('candidates',0)} · signals {s.get('signals',0)} · last scan {ago}s ago")
+            ents = MULTI.by_chain.get(k, []); act = sum(1 for e in ents if entry_active(e))
+            if not ents: L.append(f"{CHAINS[k]['emoji']} {k}: no tokens listed on scanned exchanges"); continue
+            with TS_LOCK: tiers = Counter(TSTATE[(k, e["key"])]["tier"] for e in ents if (k, e["key"]) in TSTATE)
+            L.append(f"{CHAINS[k]['emoji']} {k}{' (PAUSED)' if k in PAUSED else ''}: tokens {len(ents)} (active {act}, hot {tiers.get('hot',0)}, warm {tiers.get('warm',0)}, cold {tiers.get('cold',0)})")
+            src = Counter(l["cex"] for e in ents for l in e["listings"])
+            L.append("     by exchange: " + ", ".join(f"{c} {n}" for c, n in src.most_common(5)))
+            L.append(f"     {s.get('pools',0)} pools seen · {s.get('candidates',0)} candidates · {s.get('signals',0)} signals · last scan {ago}s ago")
         L.append("\nAPI: " + esc(API.line())); return "\n".join(L)
     if cmd == "/check": return cmd_check(arg) if arg else "Usage: /check SYMBOL"
     if cmd == "/report": daily_report(); return "Report sent."
@@ -1881,14 +1933,18 @@ def handle_command(text):
         DB.q("DELETE FROM blacklist WHERE key=?", (k,), commit=True); return f"Removed {esc(arg)} from blacklist"
     return "Unknown command. /help"
 def telegram_poll_loop():
-    offset = None
+    offset = None; c409 = [0]
     while True:
         try:
             r = session().get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates", params={"timeout": 25, "offset": offset}, timeout=35)
-            if r.status_code == 409: log.warning("Telegram 409: co 2 ban bot dang chay cung token!"); time.sleep(30); continue
+            if r.status_code == 409:
+                c409[0] += 1
+                if c409[0] in (1, 20) or c409[0] % 120 == 0: log.warning("Telegram 409: ANOTHER instance is polling this bot token (old service / PC?). Commands may not work until it is stopped.")
+                time.sleep(30); continue
             if r.status_code != 200: time.sleep(10); continue
+            c409[0] = 0
             for u in r.json().get("result", []):
-                offset = u["update_id"] + 1; m = u.get("message") or {}
+                offset = u["update_id"] + 1; m = u.get("message") or u.get("channel_post") or {}
                 if str((m.get("chat") or {}).get("id")) != CHAT_ID or not m.get("text", "").startswith("/"): continue
                 def run(txt=m["text"]):
                     try: send_long(handle_command(txt))
@@ -1939,8 +1995,14 @@ def cleanup():
     with BL_LOCK:
         for k in [k for k, u in BL.items() if u < now]: BL.pop(k, None)
 
+STARTUP_MARK = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)) or ".", ".startup_sent")
 def startup_report():
     MULTI.first_done.wait(timeout=240)
+    try:
+        if time.time() - os.path.getmtime(STARTUP_MARK) < 6 * 3600: log.info("Bo qua tin khoi dong (da gui trong 6h)"); return
+    except OSError: pass
+    try: open(STARTUP_MARK, "w").write(str(time.time()))
+    except OSError: pass
     warn = []
     for ch, cfg in CHAINS.items():
         if cfg["kind"] == "evm" and not cfg.get("rpc") and not cfg.get("blockscout"): warn.append(f"{ch}: missing RPC_{ch} → cannot read token decimals")
@@ -1951,8 +2013,8 @@ def startup_report():
          f"Chains: {', '.join(CHAINS)}",
          f"Alert when net profit ≥ {MIN_NET_PCT}% & ≥ {fmt_usd(MIN_NET_USD)} · dynamic size {fmt_usd(ORDER_SIZE_MIN)}–{fmt_usd(ORDER_SIZE_MAX)}",
          f"Daily report: {DAILY_REPORT_HOUR}:00 (UTC+7)", "", "<b>Exchanges:</b>"] + cex_health_lines()
-    tot = {k: len(v) for k, v in MULTI.by_chain.items()}
-    L.append("\nTokens per chain: " + ", ".join(f"{k}={v}" for k, v in tot.items()))
+    L.append("\nTokens per chain: " + ", ".join(f"{k}={len(v)}" for k, v in MULTI.by_chain.items()))
+    L.append(f"Scanning: 1 queue · {DEX_RPM:.0f} DexScreener req/min · hot {HOT_SEC:.0f}s / warm {WARM_SEC:.0f}s / cold {COLD_SEC/60:.0f}m")
     if ALLOW_UNVERIFIED_STATUS: warn.append("ALLOW_UNVERIFIED_STATUS=1 → may alert when deposit/withdraw is unverified. Recommend 0")
     if OBSOLETE_ENV: warn.append("Obsolete env vars, please remove: " + ", ".join(OBSOLETE_ENV))
     if not env_str("RENDER_EXTERNAL_URL") and not env_str("KEEPALIVE_URL"): warn.append("RENDER_EXTERNAL_URL not found → keepalive off, Free plan may sleep")
@@ -1967,16 +2029,13 @@ def main():
     threading.Thread(target=followup_loop, daemon=True, name="Follow").start()
     threading.Thread(target=scheduler_loop, daemon=True, name="Sched").start()
     threading.Thread(target=keepalive_loop, daemon=True, name="Keepalive").start()
-    threading.Thread(target=MULTI.ensure, daemon=True, name="Init").start()
+    threading.Thread(target=refresher_loop, daemon=True, name="Refresh").start()
     threading.Thread(target=startup_report, daemon=True, name="Startup").start()
     MULTI.first_done.wait(timeout=240)
-    workers = {}
-    for k in CHAINS:
-        w = Worker(k); w.start(); workers[k] = w; time.sleep(1.0)
+    w = Worker(); w.start()
     while True:
         time.sleep(120); cleanup()
-        for k, w in workers.items():
-            if not w.thread.is_alive() or time.time() - STATS[k].last_beat > STUCK_SEC:
-                log.warning("[SUPERVISOR] khoi dong lai %s", k); w.restart()
+        if not w.thread.is_alive() or time.time() - SCAN_HEALTH["last_batch"] > STUCK_SEC:
+            log.warning("[SUPERVISOR] khoi dong lai luong quet"); w.restart()
 
 if __name__ == "__main__": main()
