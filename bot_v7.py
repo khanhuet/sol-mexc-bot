@@ -35,9 +35,25 @@ def env_str(name, default=""):
 def env_float(name, default): return float(env_str(name, str(default)) or default)
 def env_int(name, default): return int(float(env_str(name, str(default)) or default))
 def env_bool(name, default="1"): return env_str(name, default).lower() in ("1", "true", "yes", "on")
+def _missing_env_server(missing):
+    """Thieu env bat buoc: KHONG thoat (tranh Render bao 'No open ports' + vong khoi dong lai),
+    mo cong PORT tra ve thong bao loi va ghi log moi 60s cho den khi duoc cau hinh."""
+    import http.server, socketserver
+    msg = f"BOT CHUA CHAY - thieu bien moi truong: {', '.join(missing)}. Vao Render > Environment de them roi Save."
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.end_headers(); self.wfile.write(msg.encode())
+        def log_message(self, *a): pass
+    def nag():
+        while True: print("[CONFIG] " + msg, flush=True); time.sleep(60)
+    threading.Thread(target=nag, daemon=True).start()
+    socketserver.TCPServer.allow_reuse_address = True
+    socketserver.TCPServer(("0.0.0.0", int(os.getenv("PORT", "10000"))), H).serve_forever()
 def require_env(name):
-    v = os.environ.get(name)
-    if not v: sys.exit(f"Thieu bien moi truong: {name}")
+    v = os.environ.get(name, "").strip().strip('"').strip("'")
+    if not v:
+        missing = [n for n in ("TELEGRAM_TOKEN", "CHAT_ID") if not os.environ.get(n, "").strip()]
+        _missing_env_server(missing or [name])
     return v
 
 TELEGRAM_TOKEN = require_env("TELEGRAM_TOKEN")
