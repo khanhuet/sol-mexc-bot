@@ -20,7 +20,7 @@ import requests
 def require_env(name):
     v = os.environ.get(name)
     if not v:
-        sys.exit(f"Thieu bien moi truong: {name}")
+        sys.exit(f"Missing env: {name}")
     return v
 def env_float(name, default):
     return float(os.getenv(name, default))
@@ -1383,7 +1383,7 @@ def process_followup(row):
                 if p["direction"] == direction:
                     value, status = p["adj_net_pct"], "ok"
     except Exception as e:
-        log.warning("Follow-up loi: %s", e)
+        log.warning("Follow-up error: %s", e)
         status = "error"
     DB.finish_followup(fid, sid, minutes, value, status)
     if minutes == 5 and status in ("ok", "gone"):
@@ -1439,11 +1439,11 @@ def send_telegram(text):
                            data={"chat_id": CHAT_ID, "text": text[:4000], "parse_mode": "HTML",
                                  "disable_web_page_preview": True}, timeout=15)
         if r.status_code != 200:
-            log.warning("Telegram that bai %s: %s", r.status_code, r.text[:200])
+            log.warning("Telegram failed %s: %s", r.status_code, r.text[:200])
             return False
         return True
     except Exception as e:
-        log.warning("Telegram loi: %s", e)
+        log.warning("Telegram error: %s", e)
         return False
 
 def get_dex_swap_urls(chain_key, contract):
@@ -1559,8 +1559,8 @@ def send_alert(chain_key, tok, pool, p):
 def summary_text(limit=12):
     rows = DB.summary()
     if not rows:
-        return "Chua co du lieu."
-    lines = ["<b>Thong ke (500 signal gan nhat)</b>"]
+        return "No data yet."
+    lines = ["<b>Stats (last 500 signals)</b>"]
     for r in rows[:limit]:
         wr = f"{r['winrate_5m']*100:.0f}%" if r["winrate_5m"] is not None else "n/a"
         av = f"{r['avg_net_5m']:+.2f}%" if r["avg_net_5m"] is not None else "n/a"
@@ -1594,7 +1594,7 @@ def handle_command(text):
     if cmd == "/top":
         rows = DB.recent(10)
         if not rows:
-            return "Chua co signal."
+            return "No signals yet."
         out = ["<b>10 signal gan nhat</b>"]
         for r in rows:
             f5 = f"{r['net_pct_5m']:+.2f}%" if r["net_pct_5m"] is not None else (r["st_5m"] or "...")
@@ -1602,16 +1602,16 @@ def handle_command(text):
         return "\n".join(out)
     if cmd == "/pause":
         if arg in CHAINS:
-            PAUSED.add(arg); return f"Da pause {arg}"
-        return "Chain khong hop le: " + ", ".join(CHAINS)
+            PAUSED.add(arg); return f"Paused {arg}"
+        return "Invalid chain: " + ", ".join(CHAINS)
     if cmd == "/resume":
-        PAUSED.discard(arg); return f"Da resume {arg}"
+        PAUSED.discard(arg); return f"Resumed {arg}"
     if cmd == "/blacklist" and arg:
         until = time.time() + 7 * 86400
         with BL_LOCK:
             BL[f"SYM:{arg}"] = until
         DB.save_blacklist(f"SYM:{arg}", until, "manual")
-        return f"Da blacklist {esc(arg)} 7 ngay"
+        return f"Da blacklist {esc(arg)} 7 days"
     if cmd == "/unblacklist" and arg:
         with BL_LOCK:
             BL.pop(f"SYM:{arg}", None)
@@ -1651,7 +1651,7 @@ def handle_command(text):
             return "\n".join(lines[:30])
         except Exception as e:
             return f"Live loi {e}"
-    return "Lenh khong hop le. /help"
+    return "Invalid command. /help"
 
 def telegram_poll_loop():
     offset = None
@@ -1671,9 +1671,9 @@ def telegram_poll_loop():
                 try:
                     send_telegram(handle_command(m["text"]))
                 except:
-                    log.exception("Lenh loi")
+                    log.exception("Command error")
         except Exception as e:
-            log.warning("Poll Telegram loi: %s", e)
+            log.warning("Poll Telegram error: %s", e)
             time.sleep(10)
 
 def check_candidate(chain_key, tok, pool):
@@ -2100,7 +2100,7 @@ def heartbeat_loop():
                     last_sent = today
             time.sleep(60)
         except Exception as e:
-            log.exception("Heartbeat loi: %s", e)
+            log.exception("Heartbeat error: %s", e)
             time.sleep(60)
 
 def cleanup():
@@ -2141,7 +2141,7 @@ def start_web():
         if not authed():
             return "forbidden", 403
         return jsonify(DB.summary())
-    log.info("Web tren 0.0.0.0:%s", PORT)
+    log.info("Web on 0.0.0.0:%s", PORT)
     try:
         from waitress import serve
         serve(app, host="0.0.0.0", port=PORT)
