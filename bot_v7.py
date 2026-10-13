@@ -24,7 +24,7 @@ from urllib.parse import urlencode, quote as urlquote
 from zoneinfo import ZoneInfo
 import requests
 
-VERSION = "V11.6"
+VERSION = "V11.7"
 try: VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 except Exception: VN_TZ = timezone(timedelta(hours=7))
 
@@ -1081,7 +1081,7 @@ def fetch_dex_pools(ch, addrs):
 
 # ============================ DECIMALS ============================
 DEC_CACHE = {}; DEC_LOCK = threading.Lock()
-def get_decimals(ch, token):
+def get_decimals(ch, token, price_hint=None):
     key = (ch, norm_addr(ch, token))
     with DEC_LOCK:
         if key in DEC_CACHE: return DEC_CACHE[key]
@@ -1102,10 +1102,27 @@ def get_decimals(ch, token):
             if dec is None and cfg.get("blockscout"):
                 dec = fnum_or_none(jget(http_get(f"{cfg['blockscout'].rstrip('/')}/api/v2/tokens/{token}", timeout=10), "decimals"))
     except Exception as e: log.debug("decimals loi %s %s: %s", ch, token[:10], e)
+    if dec is None and price_hint and CHAINS[ch]["kind"] == "evm" and CHAINS[ch].get("kyber"):
+        dec = decimals_from_kyber(ch, token, price_hint)   # mang khong co RPC (Robinhood, Arc...): suy ra tu quote
     API.report(f"rpc-{ch}", dec is not None)
     if dec is not None and 0 <= int(dec) <= 36:
         with DEC_LOCK: DEC_CACHE[key] = int(dec)
         return int(dec)
+    return None
+
+def decimals_from_kyber(ch, token, price):
+    """Suy decimals: quote ~$20 vao token -> amountOut (wei) va amountOutUsd; so token = USD / gia -> 10^dec = wei / so token."""
+    try:
+        cfg = CHAINS[ch]; st = cfg.get("stable")
+        if st: rs, _ = kyber_route(cfg["kyber"], st[0], token, 20 * 10**st[1])
+        else: rs, _ = kyber_route(cfg["kyber"], NATIVE, token, 10**16)
+        if not rs: return None
+        raw, usd = fnum(rs.get("amountOut")), fnum(rs.get("amountOutUsd"))
+        if raw <= 0 or usd <= 0 or price <= 0: return None
+        x = math.log10(raw / (usd / price)); d = round(x)
+        if abs(x - d) < 0.15 and 0 <= d <= 36:
+            log.info("decimals %s %s suy tu KyberSwap = %d", ch, token[:10], d); return d
+    except Exception as e: log.debug("decimals_from_kyber loi %s", e)
     return None
 
 # ============================ QUOTE DEX ============================
@@ -1410,7 +1427,7 @@ def evaluate(ch, tok, pool, depth, diag=None, fixed=None, only_dir=None):
     if sec["bad"]: st.inc("tax_skip"); diag.add(f"security: {sec['bad']}"); return []
     if max(sec["buy"], sec["sell"], sec["transfer"]) > TAX_MAX: st.inc("tax_skip"); diag.add(f"tax too high (buy {sec['buy']*100:.1f}% / sell {sec['sell']*100:.1f}% / transfer {sec['transfer']*100:.1f}%)"); return []
     if not sec["known"] and not sec.get("nosource") and UNKNOWN_TAX_MODE == "skip": st.inc("tax_skip"); diag.add("tax could not be verified (UNKNOWN_TAX_MODE=skip)"); return []
-    dec = get_decimals(ch, tok["contract"])
+    dec = get_decimals(ch, tok["contract"], pool["price"])
     if dec is None: st.inc("quote_fail"); diag.add("cannot read decimals (check RPC)"); return []
     fee_cex = ex.taker_fee(tok["cex_pair"]); out = []
     plans = []
@@ -2006,6 +2023,18 @@ def start_web():
         except Exception as e: return plain(f"{VERSION} running (status error: {e})")
     @app.route("/check/<sym>")
     def check(sym): return plain(cmd_check(sym.upper()))
+    @app.route("/debug/networks")
+    def dbg_networks():
+        """Moi san / moi chain: ten mang goc va vi du token -> phat hien san gan nham chain."""
+        out = []
+        for n, toks in MULTI.tokens.items():
+            by = {}
+            for t in toks: by.setdefault(t["chain"], Counter())[t["raw_network"]] += 1
+            for ch, cnt in sorted(by.items()):
+                ex_syms = [t["symbol"] for t in toks if t["chain"] == ch][:8]
+                out.append(f"{n} -> {ch}: {sum(cnt.values())} | raw names: {dict(cnt.most_common(5))} | e.g. {', '.join(ex_syms)}")
+        with UNKNOWN_LOCK: out.append("\nUnrecognized: " + ", ".join(f"{k}({v})" for k, v in UNKNOWN_NETS.most_common(40)))
+        return plain("\n".join(out))
     @app.route("/config")
     def config(): return plain(handle_command("/config"))
     @app.route("/health")
