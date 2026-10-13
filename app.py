@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 import subprocess, sys, os, time
-# V12 EN - launcher, web runs inside bot_v7.py
+# V13 FINAL - 11 CHAINS + 10 CEX + ALL DEX + MAKER 0% + INVENTORY + WS LIVE + AI
 def main():
     target = "bot_v7.py"
-    cexs = os.getenv('ENABLED_CEXS','FULL 10 CEX DEFAULT')
-    print(f"[APP V12 EN FULL] Starting {target} 11 CHAINS + 10 CEX + ALL DEX | ENABLED_CEXS={cexs} | PORT={os.getenv('PORT','10000')}")
+    cexs = os.getenv('ENABLED_CEXS','MEXC,GATE,BYBIT,BINANCE,OKX,KUCOIN,BITGET,BINGX,HTX,LBANK')
+    print(f"[APP V13 FINAL] Starting {target} | 11 CHAINS + 10 CEX + ALL DEX + MAKER + INVENTORY | CEX={cexs} | PORT={os.getenv('PORT','10000')}")
     while True:
         try:
             result = subprocess.run([sys.executable, target])
