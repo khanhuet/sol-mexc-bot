@@ -9,7 +9,10 @@ def main():
     while True:
         t0 = time.time()
         try:
-            code = subprocess.run([sys.executable, target]).returncode
+            env = dict(os.environ)
+            env.setdefault("MALLOC_ARENA_MAX", "2")      # giam RAM: Python nhieu luong tren glibc ton RAM neu khong gioi han arena
+            env.setdefault("PYTHONUNBUFFERED", "1")
+            code = subprocess.run([sys.executable, target], env=env).returncode
             print(f"[APP] bot thoat voi ma {code}", flush=True)
         except Exception as e:
             print(f"[APP] loi: {e}", flush=True)
