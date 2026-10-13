@@ -1,2220 +1,1933 @@
 #!/usr/bin/env python3
 """
-BOT V8.9.1 - MULTI-CEX 9 SAN + DEPOSIT/WITHDRAW CHECK + WS LIVE + INVENTORY
-1. Maker 0% vs Taker - hybrid fee with depth check
-2. Dynamic size 200-2000$ based on liquidity
-3. Real transfer time + volatility decay
-4. New memecoin (<24h) allowed if vol/txns high + honeypot simulation
-5. Volatile inventory tracker for pre-hold
-6. Multi-CEX architecture (MEXC + GATE ready, expandable)
-7. AI Score 0-100
-8. WebSocket ready structure (REST now, WS upgrade path)
-"""
+BOT V11.0 - CANH BAO CHENH LECH GIA CEX <-> DEX (PAPER / CHI BAO, KHONG TU DONG GIAO DICH)
 
-import hashlib, hmac, html, json, logging, math, os, re, sqlite3, sys, threading, time
+CEX : MEXC, GATE, KUCOIN, BITGET, BYBIT, BINANCE, OKX, BINGX, HTX, LBANK
+DEX : BNB, SOL, BASE, ETH, POLYGON, ARBITRUM, AVAX, HYPEREVM, ROBINHOOD, ARC, NEAR
+
+Quy trinh moi token:
+ 1. Lay danh sach token + mang + contract + trang thai nap/rut tu tung CEX
+ 2. Tim pool DEX dung contract (DexScreener) -> loc thanh khoan / volume / tuoi pool
+ 3. Kiem tra contract: CEX cong bo == DEX, symbol khop, gia khong lech bat thuong
+ 4. Kiem tra tax (buy / sell / transfer) + honeypot (honeypot.is, GoPlus, RPC Solana)
+ 5. Size dong 200-2000$: thu nhieu muc size, quote THAT tren DEX aggregator
+    (KyberSwap / Jupiter / Ref) va an THAT vao so lenh CEX -> chon size lai $ cao nhat
+ 6. Lai rong (sau phi CEX, phi rut, gas, tax, truot gia) >= MIN_NET_PCT (mac dinh 2%)
+ 7. Xac nhan lai sau vai giay -> bao Telegram day du
+Bao cao: chi 1 lan/ngay luc 21:00 (UTC+7). Canh bao loi he thong: toi da 1 lan / 6h moi loai.
+"""
+import base64, hashlib, hmac, html, json, logging, math, os, re, sqlite3, sys, threading, time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-from urllib.parse import urlencode
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode, quote as urlquote
+from zoneinfo import ZoneInfo
 import requests
 
+VERSION = "V11.1"
+try: VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+except Exception: VN_TZ = timezone(timedelta(hours=7))
+
+def env_str(name, default=""):
+    v = os.getenv(name, default).strip().strip('"').strip("'").strip()
+    if v.upper().startswith(name.upper() + "="): v = v[len(name) + 1:].strip().strip('"').strip("'")   # loi dan "NAME=..." vao o gia tri
+    return v
+def env_float(name, default): return float(env_str(name, str(default)) or default)
+def env_int(name, default): return int(float(env_str(name, str(default)) or default))
+def env_bool(name, default="1"): return env_str(name, default).lower() in ("1", "true", "yes", "on")
 def require_env(name):
     v = os.environ.get(name)
-    if not v:
-        sys.exit(f"Thieu bien moi truong: {name}")
+    if not v: sys.exit(f"Thieu bien moi truong: {name}")
     return v
-def env_float(name, default):
-    return float(os.getenv(name, default))
-def env_bool(name, default="1"):
-    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 TELEGRAM_TOKEN = require_env("TELEGRAM_TOKEN")
 CHAT_ID = str(require_env("CHAT_ID"))
-MEXC_API_KEY = require_env("MEXC_API_KEY")
-MEXC_SECRET = require_env("MEXC_SECRET")
-PORT = int(os.getenv("PORT", 10000))
-DB_PATH = os.getenv("DB_PATH", "paper_trades.db")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
-ORDER_SIZE_USD = env_float("ORDER_SIZE_USD", 500)  # base, will be overridden by dynamic
-ORDER_SIZE_MIN = env_float("ORDER_SIZE_MIN", 200)
-ORDER_SIZE_MAX = env_float("ORDER_SIZE_MAX", 2000)
-THRESHOLD_NET = env_float("THRESHOLD_NET", 0.8)
-PREFILTER_GROSS = env_float("PREFILTER_GROSS", 0.8)
-MAX_GROSS = env_float("MAX_GROSS", 7.0)
-MAX_IMPACT_PCT = env_float("MAX_IMPACT_PCT", 0.8)
-MIN_LIQ_USD = env_float("MIN_LIQ_USD", 90000)
-MIN_VOL_24H = env_float("MIN_VOL_24H", 40000)
-MIN_TXNS_H1 = int(env_float("MIN_TXNS_H1", 15))
-MIN_POOL_AGE_H = env_float("MIN_POOL_AGE_H", 24)
-MIN_POOL_AGE_MEME_H = env_float("MIN_POOL_AGE_MEME_H", 1)  # cho memecoin moi
-ALLOW_NEW_MEME = env_bool("ALLOW_NEW_MEME", "1")
-MAX_MEXC_SPREAD = env_float("MAX_MEXC_SPREAD", 2.0)
-MEXC_TAKER_FEE = env_float("MEXC_TAKER_FEE", 0.002)
-MEXC_MAKER_FEE = env_float("MEXC_MAKER_FEE", 0.0)
-MAKER_DEPTH_MULTIPLIER = env_float("MAKER_DEPTH_MULTIPLIER", 2.0)  # depth phai gap 2x size moi dam dung maker
-EXTRA_SLIPPAGE = env_float("EXTRA_SLIPPAGE", 0.001)
-TAX_MAX = env_float("TAX_MAX", 0.05)
-RISK_K = env_float("RISK_K", 0.5)
-RISK_FLOOR = env_float("RISK_FLOOR", 0.10)
-SOFT_FLAG_BUFFER = env_float("SOFT_FLAG_BUFFER", 0.20)
-UNKNOWN_SEC_BUFFER = env_float("UNKNOWN_SEC_BUFFER", 0.30)
-COOLDOWN_MIN = env_float("COOLDOWN_MIN", 25)
-SCAN_PAUSE_SEC = env_float("SCAN_PAUSE_SEC", 40)
-STUCK_SEC = env_float("STUCK_SEC", 900)
-STATIC_TTL = env_float("STATIC_TTL", 600)
-BOOK_TTL = 10
-DEX_BATCH = 30
-FOLLOWUP_MIN = (5, 10)
-REAL_PRICE_CHECK = env_bool("REAL_PRICE_CHECK", "1")
-REQUIRE_REAL_PRICE = env_bool("REQUIRE_REAL_PRICE", "1")
-ADAPTIVE = env_bool("ADAPTIVE", "1")
-BAD_STREAK_BLACKLIST = int(env_float("BAD_STREAK_BLACKLIST", 3))
-BLACKLIST_HOURS = env_float("BLACKLIST_HOURS", 24)
-# V8.8 new
-VOLATILE_CHG_THRESHOLD = env_float("VOLATILE_CHG_THRESHOLD", 5.0)  # 5m change >5% la bien dong
-VOLATILE_COUNT_TO_HOT = int(env_float("VOLATILE_COUNT_TO_HOT", 3))
-AI_SCORE_MIN = env_float("AI_SCORE_MIN", 60)
-ENABLED_CEXS = os.getenv("ENABLED_CEXS", "MEXC,GATE,BYBIT,BINANCE,OKX,KUCOIN,BITGET,BINGX,HTX,LBANK").split(",")  # danh sach CEX muon chay
 
-JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "")
-JUPITER_LITE_URL = os.getenv("JUPITER_LITE_URL", "https://lite-api.jup.ag/swap/v1/quote")
-JUPITER_PRO_URL = os.getenv("JUPITER_PRO_URL", "https://api.jup.ag/swap/v1/quote")
-PARASWAP_URL = os.getenv("PARASWAP_URL", "https://api.paraswap.io/prices")
-SOL_RPC = os.getenv("SOL_RPC", "https://api.mainnet-beta.solana.com")
-RPC_URLS = {
-    "BNB": os.getenv("RPC_BNB", "https://bsc-dataseed.binance.org"),
-    "BASE": os.getenv("RPC_BASE", "https://mainnet.base.org"),
-    "ETH": os.getenv("RPC_ETH", "https://ethereum-rpc.publicnode.com"),
-    "POLYGON": os.getenv("RPC_POLYGON", "https://polygon-rpc.com"),
-    "ARBITRUM": os.getenv("RPC_ARBITRUM", "https://arb1.arbitrum.io/rpc"),
-}
+ALLOWED_CEXS = ("MEXC","GATE","KUCOIN","BITGET","BYBIT","BINANCE","OKX","BINGX","HTX","LBANK")
+ENABLED_CEXS = [c for c in (x.strip().strip('"').upper() for x in env_str("ENABLED_CEXS", ",".join(ALLOWED_CEXS)).split(",")) if c in ALLOWED_CEXS]
+if not ENABLED_CEXS: sys.exit(f"ENABLED_CEXS phai co it nhat 1 trong {ALLOWED_CEXS}")
 
-MEXC_BASE = "https://api.mexc.com"
-WSOL = "So11111111111111111111111111111111111111112"
-SOL_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-SOL_USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
-STABLE = {
-    56:    ("0x55d398326f99059fF775485246999027B3197955", 18),
-    8453:  ("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", 6),
-    1:     ("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", 6),
-    137:   ("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", 6),
-    42161: ("0xaf88d065e77c8cC2239327C5EDb3A432268e5831", 6),
+KEYS = {
+    "MEXC":   (env_str("MEXC_API_KEY"), env_str("MEXC_SECRET"), ""),
+    "GATE":   (env_str("GATE_API_KEY"), env_str("GATE_SECRET"), ""),
+    "BYBIT":  (env_str("BYBIT_API_KEY"), env_str("BYBIT_SECRET"), ""),
+    "BINANCE":(env_str("BINANCE_API_KEY"), env_str("BINANCE_SECRET"), ""),
+    "OKX":    (env_str("OKX_API_KEY"), env_str("OKX_SECRET"), env_str("OKX_PASSPHRASE")),
+    "BINGX":  (env_str("BINGX_API_KEY"), env_str("BINGX_SECRET"), ""),
 }
-STABLE_ADDRS = {a.lower() for a, _ in STABLE.values()} | {SOL_USDC.lower(), SOL_USDT.lower()}
-QUOTE_OK = {"USDC", "USDT", "WETH", "WBNB", "SOL", "WSOL", "ETH", "BNB", "WMATIC", "POL", "DAI", "USDC.E"}
+def has_key(cex):
+    k = KEYS.get(cex)
+    if not k: return False
+    return bool(k[0] and k[1] and (k[2] or cex != "OKX"))
+
+# ---------------- Nguong & bo loc ----------------
+PORT = env_int("PORT", 10000); DB_PATH = env_str("DB_PATH", "arb_v11.db"); ADMIN_TOKEN = env_str("ADMIN_TOKEN")
+MIN_NET_PCT = env_float("MIN_NET_PCT", 2.0)          # lai rong toi thieu (%), sau MOI chi phi
+MIN_NET_USD = env_float("MIN_NET_USD", 3.0)          # lai rong toi thieu ($) - $200 x 2% = $4 nen de 3$
+ORDER_SIZE_MIN = env_float("ORDER_SIZE_MIN", 200); ORDER_SIZE_MAX = env_float("ORDER_SIZE_MAX", 2000)
+SIZE_STEPS = sorted({float(x) for x in env_str("SIZE_STEPS", "200,300,500,750,1000,1500,2000").split(",") if x.strip()})
+SIZE_LIQ_MAX_FRAC = env_float("SIZE_LIQ_MAX_FRAC", 0.02)   # size <= 2% tong thanh khoan DEX (cong tat ca DEX)
+SIZE_MODE = env_str("SIZE_MODE", "pct").lower()            # pct = uu tien % lai cao nhat | usd = uu tien $ lai cao nhat
+MIN_POOL_LIQ_EACH = env_float("MIN_POOL_LIQ_EACH", 5000)   # pool tung DEX phai >= $5k moi duoc tinh
+MULTI_AGG = env_bool("MULTI_AGG", "1")                     # EVM: quote ca KyberSwap + ParaSwap, lay route tot nhat
+MAX_SIZE_QUOTES = env_int("MAX_SIZE_QUOTES", 5)            # so lan quote toi da khi do size
+MAX_IMPACT_PCT = env_float("MAX_IMPACT_PCT", 3.0)          # impact DEX toi da
+MAX_CEX_SLIP_PCT = env_float("MAX_CEX_SLIP_PCT", 3.0)      # truot gia toi da khi an so lenh CEX
+MAX_CEX_SPREAD = env_float("MAX_CEX_SPREAD", 3.0)          # spread bid/ask CEX toi da
+MAX_PRICE_DEV = env_float("MAX_PRICE_DEV", 0.40)           # gia CEX lech DEX > 40% -> coi la token khac / loi
+MAX_PRICE_DEV_INFERRED = env_float("MAX_PRICE_DEV_INFERRED", 0.10)
+WARN_GROSS = env_float("WARN_GROSS", 10.0)                 # chenh > 10% -> them canh bao
+MIN_LIQ_USD = env_float("MIN_LIQ_USD", 30000); MIN_VOL_24H = env_float("MIN_VOL_24H", 20000)
+MIN_TXNS_H1 = env_int("MIN_TXNS_H1", 5); MIN_POOL_AGE_H = env_float("MIN_POOL_AGE_H", 6)
+TAX_MAX = env_float("TAX_MAX", 0.10)                        # tax > 10% -> bo
+UNKNOWN_TAX_MODE = env_str("UNKNOWN_TAX_MODE", "assume").lower()   # assume | skip (chi ap dung cho mang CO nguon tax nhung tra cuu that bai)
+NO_SOURCE_TAX = env_float("NO_SOURCE_TAX", 0.0)            # mang CHUA co nguon kiem tra tax (Robinhood, HyperEVM, Arc...) -> mac dinh 0%
+UNKNOWN_TAX_ASSUME = env_float("UNKNOWN_TAX_ASSUME", 0.03)  # gia dinh 3% mua + 3% ban neu khong xac minh duoc
+EXTRA_SLIPPAGE = env_float("EXTRA_SLIPPAGE", 0.003)         # du phong truot gia khi thuc hien that
+ALLOW_INFERRED_CONTRACT = env_bool("ALLOW_INFERRED_CONTRACT", "1")  # ghep san khong cong bo contract theo symbol (chi khi duy nhat)
+ALLOW_UNVERIFIED_STATUS = env_bool("ALLOW_UNVERIFIED_STATUS", "0")  # cho phep trang thai nap/rut chua xac minh
+CONFIRM_DELAY = env_float("CONFIRM_DELAY", 2.0); COOLDOWN_MIN = env_float("COOLDOWN_MIN", 30)
+SCAN_PAUSE_SEC = env_float("SCAN_PAUSE_SEC", 20); STATIC_TTL = env_float("STATIC_TTL", 180); STALE_MAX = env_float("STALE_MAX", 900)
+STATUS_CONFIRM = env_int("STATUS_CONFIRM", 2)               # trang thai nap/rut phai giu 2 lan lam moi lien tiep moi bao
+STATUS_NOTIFY = env_bool("STATUS_NOTIFY", "1"); STATUS_MAX_LINES = env_int("STATUS_MAX_LINES", 40)
+STUCK_SEC = env_float("STUCK_SEC", 900); BOOK_TTL = 10; DEX_BATCH = 30
+DAILY_REPORT_HOUR = env_int("DAILY_REPORT_HOUR", 21)
+ERROR_ALERTS = env_bool("ERROR_ALERTS", "1"); ERROR_ALERT_EVERY_H = env_float("ERROR_ALERT_EVERY_H", 6)
+EXCLUDE_SYMBOLS = {s.strip().upper() for s in env_str("EXCLUDE_SYMBOLS", "USDT,USDC,USDE,DAI,FDUSD,TUSD,BUSD,PYUSD,USD1,USDD,USDP,EURC,USDS,USDT0").split(",") if s.strip()}
+BAD_STREAK_BLACKLIST = env_int("BAD_STREAK_BLACKLIST", 3); BLACKLIST_HOURS = env_float("BLACKLIST_HOURS", 24)
+FOLLOWUP_MIN = (5, 15)
+KEEPALIVE = env_bool("KEEPALIVE", "1")       # tu ping URL Render moi 10 phut de goi Free khong ngu
+OBSOLETE_ENV = [k for k in ("THRESHOLD_NET","PREFILTER_GROSS","MAX_GROSS","AI_SCORE_MIN","ADAPTIVE","MAKER_DEPTH_MULTIPLIER","MEXC_MAKER_FEE","ORDER_SIZE_USD",
+                            "REAL_PRICE_CHECK","REQUIRE_REAL_PRICE","RISK_K","VOLATILE_CHG_THRESHOLD","DEX_BATCH","HEARTBEAT_MIN") if os.getenv(k) is not None]
+
+TAKER_FEE = {c: env_float(f"{c}_TAKER_FEE", d) for c, d in {"MEXC":0.0005,"GATE":0.002,"KUCOIN":0.001,"BITGET":0.001,"BYBIT":0.001,"BINANCE":0.001,"OKX":0.001,"BINGX":0.001,"HTX":0.002,"LBANK":0.001}.items()}
+CEX_EXTRA_MIN = {"MEXC":3,"GATE":5,"KUCOIN":5,"BITGET":5,"BYBIT":5,"BINANCE":3,"OKX":5,"BINGX":5,"HTX":8,"LBANK":8}
+
+KYBER_URL = env_str("KYBER_URL", "https://aggregator-api.kyberswap.com"); KYBER_CLIENT_ID = env_str("KYBER_CLIENT_ID", "cexdex-alert-bot")
+JUPITER_API_KEY = env_str("JUPITER_API_KEY"); JUPITER_LITE_URL = env_str("JUPITER_LITE_URL", "https://lite-api.jup.ag/swap/v1/quote")
+JUPITER_PRO_URL = env_str("JUPITER_PRO_URL", "https://api.jup.ag/swap/v1/quote")
+PARASWAP_URL = env_str("PARASWAP_URL", "https://api.paraswap.io/prices")
+REF_ROUTER_URL = env_str("REF_ROUTER_URL", "https://smartrouter.ref.finance/findPath")
+HONEYPOT_URL = env_str("HONEYPOT_URL", "https://api.honeypot.is/v2/IsHoneypot")
+GOPLUS_URL = env_str("GOPLUS_URL", "https://api.gopluslabs.io/api/v1/token_security")
+NATIVE = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+WSOL = "So11111111111111111111111111111111111111112"; SOL_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+NEAR_USDC = "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1"
+
+# ---------------- Mang ----------------
+# stable: (dia chi, decimals) de quote theo USD. None -> quote bang native (ETH) va quy doi USD qua KyberSwap.
+def _stable(env_name, addr, dec):
+    v = env_str(env_name)
+    if v:
+        a, _, d = v.partition(":")
+        return (a.strip(), int(d or 6))
+    return (addr, dec) if addr else None
 
 CHAINS = {
-    "SOL": {"emoji": "🟣", "dex_chain": "solana", "evm": False, "gas_usd": 0.02, "transfer_min": 2,
-            "explorer": "https://solscan.io/token/", "chain_id": None,
-            "aliases": {"SOL", "SOLANA", "SOLANASOL", "SOLSOLANA", "SOLMAINNET"}},
-    "BNB": {"emoji": "🟡", "dex_chain": "bsc", "evm": True, "gas_usd": 0.15, "transfer_min": 3,
-            "explorer": "https://bscscan.com/token/", "chain_id": 56,
-            "aliases": {"BSC", "BEP20", "BSCBEP20", "BEP20BSC", "BNBSMARTCHAIN", "BNBSMARTCHAINBEP20",
-                        "BNBBEP20", "BEP20BNB", "BSCBNB"}},
-    "BASE": {"emoji": "🔵", "dex_chain": "base", "evm": True, "gas_usd": 0.05, "transfer_min": 3,
-             "explorer": "https://basescan.org/token/", "chain_id": 8453,
-             "aliases": {"BASE", "BASECHAIN", "BASEBASE", "BASEMAINNET", "BASEETH"}},
-    "ETH": {"emoji": "⚫", "dex_chain": "ethereum", "evm": True, "gas_usd": 2.5, "transfer_min": 8,
-            "explorer": "https://etherscan.io/token/", "chain_id": 1,
-            "aliases": {"ERC20", "ETH", "ETHEREUM", "ETHEREUMERC20", "ETHERC20", "ERC20ETH", "ETHEREUMETH",
-                        "ETHTOKEN", "ETHMAINNET", "ERC20ETHEREUM"}},
-    "POLYGON": {"emoji": "💜", "dex_chain": "polygon", "evm": True, "gas_usd": 0.02, "transfer_min": 5,
-                "explorer": "https://polygonscan.com/token/", "chain_id": 137,
-                "aliases": {"MATIC", "POLYGON", "POLYGONMATIC", "POLYGONPOLYGON", "MATICPOLYGON", "POLYGONPOS",
-                            "POSPOLYGON", "MATICMAINNET", "POLYGONMAINNET"}},
-    "ARBITRUM": {"emoji": "🔷", "dex_chain": "arbitrum", "evm": True, "gas_usd": 0.15, "transfer_min": 3,
-                 "explorer": "https://arbiscan.io/token/", "chain_id": 42161,
-                 "aliases": {"ARB", "ARBITRUM", "ARBITRUMONE", "ARBITRUMONEARB", "ARBONE", "ARBITRUMONEETH",
-                             "ARBITRUMMAINNET"}},
-    "ROBINHOOD": {"emoji": "🔶", "dex_chain": "robinhood", "evm": True, "gas_usd": 0.01, "transfer_min": 5,
-                  "explorer": "https://robinhoodchain.blockscout.com/token/", "chain_id": None,
-                  "aliases": {"ROBINHOOD", "ROBINHOODCHAIN", "HOODCHAIN", "RHCHAIN", "ROBINHOODCHAINETH",
-                              "ROBINHOODMAINNET"}},
-    "ARC": {"emoji": "🟪", "dex_chain": "arc", "evm": True, "gas_usd": 0.02, "transfer_min": 5,
-            "explorer": "https://explorer.arc.io/token/", "chain_id": None,
-            "aliases": {"ARC", "ARCCHAIN", "ARCNETWORK", "CIRCLEARC", "ARCARC", "ARCCHAINMAINNET"}},
-    "NEAR": {"emoji": "🟢", "dex_chain": "near", "evm": False, "gas_usd": 0.01, "transfer_min": 3,
-             "explorer": "https://nearblocks.io/token/", "chain_id": None,
-             "aliases": {"NEAR", "NEARPROTOCOL", "NEARNEAR", "NEARMAINNET", "NEARTOKEN"}},
+    "SOL":      dict(kind="sol",  emoji="🟣", name="Solana",   dex="solana",   explorer="https://solscan.io/token/", gas_usd=0.01, transfer_min=2,
+                     aliases={"SOL","SOLANA","SPL","SOLSPL","SOLANASPL","SOLMAINNET","SOLANAMAINNET","SOLSOL"}),
+    "BNB":      dict(kind="evm",  emoji="🟡", name="BNB Chain", dex="bsc",      chain_id=56,    kyber="bsc",       stable=_stable("STABLE_BNB","0x55d398326f99059fF775485246999027B3197955",18),
+                     rpc=env_str("RPC_BNB","https://bsc-dataseed.bnbchain.org"), explorer="https://bscscan.com/token/", gas_usd=0.10, transfer_min=3,
+                     aliases={"BSC","BEP20","BSCBEP20","BEP20BSC","BNBSMARTCHAIN","BNBSMARTCHAINBEP20","BNBBEP20","BEP20BNB","BSCBNB","BNBCHAIN","BNBSC"}),
+    "BASE":     dict(kind="evm",  emoji="🔵", name="Base",      dex="base",     chain_id=8453,  kyber="base",      stable=_stable("STABLE_BASE","0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",6),
+                     rpc=env_str("RPC_BASE","https://mainnet.base.org"), explorer="https://basescan.org/token/", gas_usd=0.03, transfer_min=5,
+                     aliases={"BASE","BASECHAIN","BASEMAINNET","BASEETH","BASEEVM","BASENETWORK"}),
+    "ETH":      dict(kind="evm",  emoji="⚫", name="Ethereum",  dex="ethereum", chain_id=1,     kyber="ethereum",  stable=_stable("STABLE_ETH","0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",6),
+                     rpc=env_str("RPC_ETH","https://ethereum-rpc.publicnode.com"), explorer="https://etherscan.io/token/", gas_usd=2.0, transfer_min=8,
+                     aliases={"ERC20","ETH","ETHEREUM","ETHEREUMERC20","ETHERC20","ERC20ETH","ETHEREUMETH","ETHMAINNET","ERC20ETHEREUM"}),
+    "POLYGON":  dict(kind="evm",  emoji="💜", name="Polygon",   dex="polygon",  chain_id=137,   kyber="polygon",   stable=_stable("STABLE_POLYGON","0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",6),
+                     rpc=env_str("RPC_POLYGON","https://polygon-rpc.com"), explorer="https://polygonscan.com/token/", gas_usd=0.02, transfer_min=6,
+                     aliases={"MATIC","POLYGON","POLYGONMATIC","MATICPOLYGON","POLYGONPOS","POSPOLYGON","POLYGONMAINNET","POL","POLYGONPOL","PLASMA_NO"}),
+    "ARBITRUM": dict(kind="evm",  emoji="🔷", name="Arbitrum",  dex="arbitrum", chain_id=42161, kyber="arbitrum",  stable=_stable("STABLE_ARBITRUM","0xaf88d065e77c8cC2239327C5EDb3A432268e5831",6),
+                     rpc=env_str("RPC_ARBITRUM","https://arb1.arbitrum.io/rpc"), explorer="https://arbiscan.io/token/", gas_usd=0.05, transfer_min=4,
+                     aliases={"ARB","ARBITRUM","ARBITRUMONE","ARBONE","ARBITRUMONEARB","ARBITRUMONEETH","ARBITRUMMAINNET","ARBEVM"}),
+    "AVAX":     dict(kind="evm",  emoji="🔺", name="Avalanche C", dex="avalanche", chain_id=43114, kyber="avalanche", stable=_stable("STABLE_AVAX","0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E",6),
+                     rpc=env_str("RPC_AVAX","https://api.avax.network/ext/bc/C/rpc"), explorer="https://snowtrace.io/token/", gas_usd=0.05, transfer_min=3,
+                     aliases={"AVAXC","AVAXCCHAIN","CCHAIN","AVALANCHECCHAIN","AVALANCHEC","CAVAX","AVAXC20","AVAXCHAIN","AVALANCHE","AVAX"}),
+    "HYPEREVM": dict(kind="evm",  emoji="🟢", name="HyperEVM",  dex="hyperevm", chain_id=999,   kyber="hyperevm",  stable=_stable("STABLE_HYPEREVM","0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb",6),
+                     rpc=env_str("RPC_HYPEREVM","https://rpc.hyperliquid.xyz/evm"), explorer="https://hyperevmscan.io/token/", gas_usd=0.05, transfer_min=3,
+                     aliases={"HYPEREVM","HYPERLIQUIDEVM","HYPEEVM","HYPEREVMHYPE","HYPERVM"}),
+    "ROBINHOOD":dict(kind="evm",  emoji="🪶", name="Robinhood Chain", dex="robinhood", chain_id=4663, kyber="robinhood", stable=_stable("STABLE_ROBINHOOD","",6),
+                     rpc=env_str("RPC_ROBINHOOD"), blockscout=env_str("BLOCKSCOUT_ROBINHOOD","https://robinhoodchain.blockscout.com"),
+                     explorer="https://robinhoodchain.blockscout.com/token/", gas_usd=0.03, transfer_min=5,
+                     aliases={"ROBINHOOD","ROBINHOODCHAIN","ROBINHOODL2","HOODCHAIN","RHCHAIN"}),
+    "ARC":      dict(kind="evm",  emoji="⭕", name="Arc",       dex="arc",      chain_id=5042,  kyber="arc",       stable=_stable("STABLE_ARC","0x3600000000000000000000000000000000000000",6),
+                     rpc=env_str("RPC_ARC"), blockscout=env_str("BLOCKSCOUT_ARC"), explorer=env_str("EXPLORER_ARC","https://arcscan.app/token/"), gas_usd=0.02, transfer_min=3,
+                     aliases={"ARC","ARCMAINNET","ARCNETWORK","CIRCLEARC","ARCCHAIN","ARCL1"}),
+    "NEAR":     dict(kind="near", emoji="🌐", name="NEAR",      dex="near", rpc=env_str("RPC_NEAR","https://rpc.mainnet.fastnear.com"),
+                     explorer="https://nearblocks.io/token/", gas_usd=0.01, transfer_min=2,
+                     aliases={"NEAR","NEARPROTOCOL","NEP141","NEARNEP141","NEARMAINNET"}),
 }
-REAL_CHAINS = {"SOL", "BNB", "BASE", "ETH", "POLYGON", "ARBITRUM"}
+SOL_RPC = env_str("SOL_RPC", "https://api.mainnet-beta.solana.com")
+PARASWAP_CHAINS = {1, 56, 137, 42161, 8453, 43114}
+GOPLUS_CHAINS = {int(x) for x in env_str("GOPLUS_CHAINS", "1,56,137,42161,8453,43114").split(",") if x.strip()}
+HONEYPOT_CHAINS = {int(x) for x in env_str("HONEYPOT_CHAINS", "1,56,8453").split(",") if x.strip()}
+
 for _k, _c in CHAINS.items():
-    _c["dex_chain"] = os.getenv(f"DEX_CHAIN_{_k}", _c["dex_chain"])
-ENABLED = [c.strip().upper() for c in os.getenv("ENABLED_CHAINS", ",".join(sorted(REAL_CHAINS, key=list(CHAINS).index))).split(",") if c.strip()]
-CHAINS = {k: v for k, v in CHAINS.items() if k in ENABLED}
+    _c["dex"] = env_str(f"DEX_CHAIN_{_k}", _c["dex"])
+    _c["gas_usd"] = env_float(f"GAS_{_k}", _c["gas_usd"]); _c["transfer_min"] = env_float(f"TRANSFER_MIN_{_k}", _c["transfer_min"])
+    _c["aliases"].discard("PLASMA_NO")
+# Them alias tu env: EXTRA_ALIASES="AVAX:AVAXC1,AVAX2;HYPEREVM:HYPE"
+for _part in env_str("EXTRA_ALIASES").split(";"):
+    if ":" in _part:
+        _ch, _al = _part.split(":", 1); _ch = _ch.strip().upper()
+        if _ch in CHAINS: CHAINS[_ch]["aliases"] |= {re.sub(r"[^A-Z0-9]", "", a.upper()) for a in _al.split(",") if a.strip()}
+_enabled = [c.strip().upper() for c in env_str("ENABLED_CHAINS", ",".join(CHAINS)).split(",") if c.strip()]
+CHAINS = {k: v for k, v in CHAINS.items() if k in _enabled}
+if not CHAINS: sys.exit("ENABLED_CHAINS rong")
+ALIAS_INDEX = {}
+for _k, _c in CHAINS.items():
+    for _a in _c["aliases"]: ALIAS_INDEX.setdefault(_a, _k)
 
-DEX_FEES = {"uniswap": 0.003, "pancakeswap": 0.0025, "sushiswap": 0.003, "quickswap": 0.003, "aerodrome": 0.003,
-            "camelot": 0.003, "raydium": 0.0025, "orca": 0.003, "meteora": 0.003}
-DEFAULT_DEX_FEE = 0.003
-
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
-                    format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s")
+logging.basicConfig(level=env_str("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s")
 log = logging.getLogger("bot")
 
-GLOBAL_SEM = threading.Semaphore(12)
+# ============================ HTTP & TIEN ICH ============================
+GLOBAL_SEM = threading.Semaphore(20)
 _local = threading.local()
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36", "Accept": "application/json"}
 def session():
     s = getattr(_local, "s", None)
-    if s is None:
-        s = _local.s = requests.Session()
+    if s is None: s = _local.s = requests.Session()
     return s
-
 class RateLimiter:
-    def __init__(self, mi):
-        self.mi = mi; self.next = 0.0; self.lock = threading.Lock()
+    def __init__(self, mi): self.mi = mi; self.next = 0.0; self.lock = threading.Lock()
     def wait(self):
         with self.lock:
-            now = time.monotonic()
-            slot = max(now, self.next)
-            self.next = slot + self.mi
+            now = time.monotonic(); slot = max(now, self.next); self.next = slot + self.mi
         d = slot - now
-        if d > 0:
-            time.sleep(d)
+        if d > 0: time.sleep(d)
+LIMITERS = {n: RateLimiter(0.12) for n in ALLOWED_CEXS}
+DEX_LIMITER = RateLimiter(env_float("DEX_LIMIT_SEC", 0.25)); KYBER_LIMITER = RateLimiter(env_float("KYBER_LIMIT_SEC", 0.25))
+JUP_LIMITER = RateLimiter(env_float("JUP_LIMIT_SEC", 1.05)); PARA_LIMITER = RateLimiter(0.5); REF_LIMITER = RateLimiter(0.3)
+SEC_LIMITER = RateLimiter(0.5); RPC_LIMITER = RateLimiter(0.1); TG_LIMITER = RateLimiter(1.1)
+BACKOFF = {}; BACKOFF_LOCK = threading.Lock()   # host -> thoi diem het backoff (sau 429)
 
-MEXC_LIMITER = RateLimiter(0.05)
-DEX_LIMITER = RateLimiter(env_float("DEX_LIMIT_SEC", 2.5))
-JUP_LIMITER = RateLimiter(0.5)
-PARA_LIMITER = RateLimiter(0.6)
-TAX_LIMITER = RateLimiter(0.4)
-RPC_LIMITER = RateLimiter(0.15)
-
-DEX_429_UNTIL = 0
-DEX_429_LOCK = threading.Lock()
-
-def http_get(url, params=None, headers=None, limiter=None, timeout=15, retries=2):
-    global DEX_429_UNTIL
-    if "dexscreener.com" in url:
-        with DEX_429_LOCK:
-            if time.time() < DEX_429_UNTIL:
-                return None
+def _host(url): return url.split("/")[2] if "://" in url else url
+def http_req(method, url, params=None, headers=None, json_body=None, limiter=None, timeout=15, retries=2):
+    host = _host(url)
+    with BACKOFF_LOCK: until = BACKOFF.get(host, 0)
+    if time.time() < until: return None
+    h = dict(UA)
+    if headers: h.update(headers)
     for attempt in range(retries + 1):
         try:
-            if limiter:
-                limiter.wait()
+            if limiter: limiter.wait()
             with GLOBAL_SEM:
-                r = session().get(url, params=params, headers=headers, timeout=timeout)
+                r = session().request(method, url, params=params, headers=h, json=json_body, timeout=timeout)
             if r.status_code == 429:
-                try:
-                    wait = float(r.headers.get("Retry-After", 30))
-                except:
-                    wait = 30
-                wait = min(wait, 60)
-                if "dexscreener.com" in url:
-                    with DEX_429_LOCK:
-                        DEX_429_UNTIL = time.time() + wait
-                log.warning("429 tu %s, ngu %.0fs", url.split("?")[0], wait)
-                time.sleep(wait)
-                continue
-            if r.status_code >= 400:
-                if r.status_code in (401,403,404):
-                    return None
-                if attempt < retries:
-                    time.sleep(1+attempt*2)
-                    continue
-                return None
+                try: wait = float(r.headers.get("Retry-After", 10))
+                except Exception: wait = 10
+                wait = min(max(wait, 3), 60)
+                with BACKOFF_LOCK: BACKOFF[host] = time.time() + wait
+                log.warning("429 tu %s -> tam dung %.0fs", host, wait); return None
+            if r.status_code >= 500 and attempt < retries: time.sleep(1 + attempt); continue
             return r
         except requests.RequestException as e:
-            log.warning("HTTP loi %s: %s", url.split("?")[0], e)
-            time.sleep(1 + attempt)
+            log.debug("HTTP loi %s: %s", url.split("?")[0], e)
+            if attempt < retries: time.sleep(1 + attempt)
     return None
-
-def rpc_post(url, body):
-    for attempt in range(2):
-        try:
-            RPC_LIMITER.wait()
-            with GLOBAL_SEM:
-                r = session().post(url, json=body, timeout=8)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code == 429:
-                time.sleep(2)
-        except Exception as e:
-            log.debug("RPC loi %s: %s", url, e)
-            time.sleep(0.5)
+def http_get(url, params=None, headers=None, limiter=None, timeout=15, retries=2):
+    return http_req("GET", url, params=params, headers=headers, limiter=limiter, timeout=timeout, retries=retries)
+def rpc_post(url, body, timeout=8):
+    if not url: return None
+    r = http_req("POST", url, json_body=body, limiter=RPC_LIMITER, timeout=timeout, retries=1)
+    if r is not None and r.status_code == 200:
+        try: return r.json()
+        except Exception: return None
     return None
+def jget(r, *path, default=None):
+    """r: Response -> json -> lay theo path an toan."""
+    if r is None or r.status_code != 200: return default
+    try: d = r.json()
+    except Exception: return default
+    for p in path:
+        if isinstance(d, dict): d = d.get(p)
+        elif isinstance(d, list) and isinstance(p, int) and -len(d) <= p < len(d): d = d[p]
+        else: return default
+        if d is None: return default
+    return d
+def http_err(r, what):
+    if r is None: return RuntimeError(f"{what}: khong phan hoi / timeout")
+    hint = ""
+    if r.status_code in (403, 451): hint = " (IP server co the bi san chan theo khu vuc)"
+    return RuntimeError(f"{what}: HTTP {r.status_code}{hint}")
 
-def mexc_signed_get(path, params=None):
-    params = params or {}
-    params["recvWindow"] = 10000
-    params["timestamp"] = int(time.time() * 1000)
-    qs = urlencode(params)
-    sig = hmac.new(MEXC_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
-    return http_get(f"{MEXC_BASE}{path}?{qs}&signature={sig}", headers={"X-MEXC-APIKEY": MEXC_API_KEY},
-                    limiter=MEXC_LIMITER)
-
-def esc(s):
-    return html.escape(str(s), quote=False)
-def fnum(x):
+def esc(s): return html.escape(str(s), quote=False)
+def esc_url(u): return html.escape(str(u), quote=True)
+def fnum(x, default=0.0):
     try:
-        return float(x)
-    except:
-        return 0.0
-def norm_addr(chain_key, addr):
-    if not addr:
-        return ""
-    a = addr.strip()
-    return a.lower() if CHAINS[chain_key].get("evm") else a
+        v = float(x)
+        return v if math.isfinite(v) else default
+    except Exception: return default
+def fnum_or_none(x):
+    if x is None or x == "": return None
+    try:
+        v = float(x); return v if math.isfinite(v) else None
+    except Exception: return None
+def as_bool(v, default=False):
+    if v is None: return default
+    if isinstance(v, bool): return v
+    if isinstance(v, (int, float)): return v != 0
+    return str(v).strip().lower() in ("1", "true", "yes", "on", "allowed", "enable", "enabled", "normal")
+def status_ok(v):
+    if v is None: return ALLOW_UNVERIFIED_STATUS
+    return bool(v)
+def status_icon(v): return "❓" if v is None else ("✅" if v else "❌")
+def base_of(pair): return pair[:-4] if pair.endswith("USDT") else pair
+def norm_sym(s): return re.sub(r"[^A-Z0-9]", "", (s or "").upper())
 
-EVM_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
-SOL_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
-def valid_contract(chain_key, c):
-    if not c:
-        return False
-    cfg = CHAINS[chain_key]
-    if cfg.get("evm"):
-        return bool(EVM_RE.match(c))
-    if chain_key == "SOL":
-        return bool(SOL_RE.match(c))
-    return len(c) > 3
+EVM_RE = re.compile(r"^0x[0-9a-fA-F]{40}$"); SOL_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+NEAR_RE = re.compile(r"^(?=.{2,64}$)(([a-z\d]+[-_])*[a-z\d]+\.)*([a-z\d]+[-_])*[a-z\d]+$")
+def chain_kind(ch): return CHAINS[ch]["kind"]
+def norm_addr(ch, a):
+    if not a: return ""
+    a = a.strip()
+    return a if chain_kind(ch) == "sol" else a.lower()
+def valid_contract(ch, c):
+    if not c or ch not in CHAINS: return False
+    k = chain_kind(ch)
+    if k == "evm": return bool(EVM_RE.match(c)) and c.lower() != "0x" + "0" * 40
+    if k == "sol": return bool(SOL_RE.match(c))
+    return bool(NEAR_RE.match(c.lower()))
 
+UNKNOWN_NETS = Counter(); UNKNOWN_LOCK = threading.Lock()
+def find_chain(*names):
+    raw = None
+    for nm in names:
+        n = norm_sym(nm)
+        if not n: continue
+        raw = raw or n
+        if n in ALIAS_INDEX: return ALIAS_INDEX[n]
+    if raw:
+        with UNKNOWN_LOCK: UNKNOWN_NETS[raw] += 1
+    return None
+
+MULT_RE = re.compile(r"^(1000000|1M|100000|10000|1000|100)([A-Z0-9]+)$")
+def unit_mult(cex_sym, dex_sym):
+    """CEX co the niem yet dang 1000PEPE (1 don vi CEX = 1000 token on-chain)."""
+    a, b = norm_sym(cex_sym), norm_sym(dex_sym)
+    if a == b: return 1.0
+    m = MULT_RE.match(a)
+    if m and m.group(2) == b: return 1e6 if m.group(1) in ("1M", "1000000") else float(m.group(1))
+    return 1.0
+def symbol_ok(cex_sym, dex_sym):
+    a, b = norm_sym(cex_sym), norm_sym(dex_sym)
+    if not a or not b: return False
+    if a == b or unit_mult(a, b) != 1.0: return True
+    return len(a) >= 3 and len(b) >= 3 and (a in b or b in a)
+
+# ============================ THONG KE ============================
 class Stat:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.c = {"attempted": 0, "fetched": 0, "opportunity": 0, "signals": 0, "suspect": 0, "errors": 0,
-                  "dex_pairs": 0, "real_price_ok": 0, "real_price_fail": 0, "blacklisted_skip": 0}
-        self.last_beat = datetime.now()
-        self.last_success = None
+    KEYS = ("scanned","pools","candidates","evaluated","signals","unconfirmed","suspect","tax_skip","contract_skip","thin","quote_fail","errors")
+    def __init__(self): self.lock = threading.Lock(); self.c = Counter(); self.day = Counter(); self.last_beat = time.time(); self.last_scan = 0.0
     def inc(self, k, n=1):
-        with self.lock:
-            self.c[k] = self.c.get(k, 0) + n
+        with self.lock: self.c[k] += n; self.day[k] += n
     def beat(self):
-        with self.lock:
-            self.last_beat = datetime.now()
-    def success(self):
-        with self.lock:
-            self.last_success = datetime.now()
-    def snapshot(self):
-        with self.lock:
-            d = dict(self.c)
-            d["last_beat"] = self.last_beat
-            d["last_success"] = self.last_success
-            return d
+        with self.lock: self.last_beat = time.time()
+    def snapshot(self, daily=False):
+        with self.lock: return dict(self.day if daily else self.c)
+    def reset_day(self):
+        with self.lock: self.day = Counter()
 STATS = {k: Stat() for k in CHAINS}
 
+ERR_LAST = {}; ERR_LOCK = threading.Lock()
+def error_alert(key, text):
+    """Canh bao loi he thong, toi da 1 lan / ERROR_ALERT_EVERY_H moi loai."""
+    if not ERROR_ALERTS: return
+    with ERR_LOCK:
+        if time.time() - ERR_LAST.get(key, 0) < ERROR_ALERT_EVERY_H * 3600: return
+        ERR_LAST[key] = time.time()
+    send_telegram("🚨 " + text)
 class ApiHealth:
-    def __init__(self):
-        self.lock = threading.Lock(); self.d = {}; self.alerted = {}
+    def __init__(self): self.lock = threading.Lock(); self.d = {}
     def report(self, name, ok):
-        need = False
         with self.lock:
             s = self.d.setdefault(name, {"ok": 0, "fail": 0, "consec": 0})
-            if ok:
-                s["ok"] += 1; s["consec"] = 0; self.alerted.pop(name, None)
-            else:
-                s["fail"] += 1; s["consec"] += 1
-                if s["consec"] >= 30 and time.time() - self.alerted.get(name, 0) > 3600:
-                    self.alerted[name] = time.time(); need = True
-        if need:
-            send_telegram(f"🚨 API <b>{esc(name)}</b> loi lien tuc {s['consec']} lan.")
+            if ok: s["ok"] += 1; s["consec"] = 0
+            else: s["fail"] += 1; s["consec"] += 1
+            consec = s["consec"]
+        if consec == 30: error_alert(f"api:{name}", f"API <b>{esc(name)}</b> loi lien tuc {consec} lan - ket qua quet co the thieu.")
     def line(self):
+        with self.lock: return " | ".join(f"{k}: {v['ok']}✓/{v['fail']}✗" for k, v in sorted(self.d.items())) or "chua co"
+    def reset(self):
         with self.lock:
-            return " | ".join(f"{k}: {v['ok']}ok/{v['fail']}fail" for k, v in self.d.items()) or "chua co"
+            for v in self.d.values(): v["ok"] = v["fail"] = 0
 API = ApiHealth()
 
-
-# ========== V8.9 MULTI-CEX ARCHITECTURE ==========
-import json as _json
-from concurrent.futures import ThreadPoolExecutor as _TPE
-
-CEX_REGISTRY = {
-    "MEXC": {
-        "name": "MEXC", "taker": 0.002, "maker": 0.0, 
-        "rest_base": "https://api.mexc.com",
-        "ws": "wss://wbs.mexc.com/ws",
-        "ws_format": "mexc"
-    },
-    "GATE": {
-        "name": "Gate.io", "taker": 0.002, "maker": 0.002,
-        "rest_base": "https://api.gateio.ws/api/v4",
-        "ws": "wss://api.gateio.ws/ws/v4/",
-        "ws_format": "gate"
-    },
-    "BINANCE": {
-        "name": "Binance", "taker": 0.001, "maker": 0.0005,
-        "rest_base": "https://api.binance.com",
-        "ws": "wss://stream.binance.com:9443/ws",
-        "ws_format": "binance"
-    },
-    "OKX": {
-        "name": "OKX", "taker": 0.001, "maker": 0.0008,
-        "rest_base": "https://www.okx.com",
-        "ws": "wss://ws.okx.com:8443/ws/v5/public",
-        "ws_format": "okx"
-    },
-    "BYBIT": {
-        "name": "Bybit", "taker": 0.001, "maker": 0.0005,
-        "rest_base": "https://api.bybit.com",
-        "ws": "wss://stream.bybit.com/v5/public/spot",
-        "ws_format": "bybit"
-    },
-    "BITGET": {
-        "name": "Bitget", "taker": 0.002, "maker": 0.002,
-        "rest_base": "https://api.bitget.com",
-        "ws": "wss://ws.bitget.com/v2/ws/public",
-        "ws_format": "bitget"
-    },
-    "LBANK": {
-        "name": "LBank", "taker": 0.002, "maker": 0.002,
-        "rest_base": "https://api.lbank.info",
-        "ws": "wss://www.lbkex.net/ws/V2/",
-        "ws_format": "lbank"
-    },
-    "KUCOIN": {
-        "name": "KuCoin", "taker": 0.001, "maker": 0.001,
-        "rest_base": "https://api.kucoin.com",
-        "ws": "wss://push-stream.kucoin.com/endpoint",
-        "ws_format": "kucoin",
-        "ws_token_url": "https://api.kucoin.com/api/v1/bullet-public"
-    },
-    "BINGX": {
-        "name": "BingX", "taker": 0.002, "maker": 0.002,
-        "rest_base": "https://open-api.bingx.com",
-        "ws": "wss://open-api-swap.bingx.com/swap-market",
-        "ws_format": "bingx"
-    },
-    "HTX": {
-        "name": "HTX", "taker": 0.002, "maker": 0.002,
-        "rest_base": "https://api.huobi.pro",
-        "ws": "wss://api.huobi.pro/ws",
-        "ws_format": "htx"
-    },
-}
-
-# Global live price cache from WebSocket
-CEX_LIVE = {}  # {cex: {symbol: {bid, ask, ts, source: ws/rest}}}
-CEX_LIVE_LOCK = threading.Lock()
-
-def update_live_price(cex, symbol, bid, ask, source="ws"):
-    with CEX_LIVE_LOCK:
-        if cex not in CEX_LIVE:
-            CEX_LIVE[cex] = {}
-        CEX_LIVE[cex][symbol] = {"bid": float(bid), "ask": float(ask), "ts": time.time(), "source": source}
-
-def get_live_price(cex, symbol):
-    with CEX_LIVE_LOCK:
-        d = CEX_LIVE.get(cex, {}).get(symbol)
-        if not d:
-            return None
-        if time.time() - d["ts"] > 30:  # stale 30s
-            return None
-        return d
-
-# Base CEX Adapter
-class BaseCEX:
-    def __init__(self, key):
-        self.key = key
-        self.cfg = CEX_REGISTRY[key]
-    def fetch_pairs(self):
-        return {}
-    def fetch_tokens(self, pairs):
-        return {}
-    def fetch_orderbook(self, symbol):
-        return None
-
-class MexcCEX(BaseCEX):
-    def __init__(self): super().__init__("MEXC")
-    def fetch_pairs(self):
-        r = http_get(f"{MEXC_BASE}/api/v3/exchangeInfo", limiter=MEXC_LIMITER, timeout=20)
-        if not r or r.status_code != 200:
-            raise RuntimeError(f"MEXC exchangeInfo fail {r.status_code if r else 'no resp'}")
-        out = {}
-        for s in r.json().get("symbols", []):
-            if s.get("quoteAsset") == "USDT" and str(s.get("status")) == "1":
-                out[s["symbol"]] = s["baseAsset"]
-        return out
-    def fetch_tokens(self, pairs):
-        # Use signed getall for withdraw/deposit + contract
-        r = mexc_signed_get("/api/v3/capital/config/getall")
-        if not r or r.status_code != 200:
-            raise RuntimeError(f"MEXC config fail")
-        base_set = set(pairs.values())
-        sym2pair = {}
-        for p, s in pairs.items():
-            sym2pair.setdefault(s, p)
-        result = {k: {} for k in CHAINS}
-        for coin in r.json():
-            sym = coin.get("coin")
-            if sym not in base_set:
-                continue
-            for net in coin.get("networkList", []) or []:
-                net_name = re.sub(r"[^A-Z0-9]", "", (net.get("network") or "").upper())
-                contract = (net.get("contract") or "").strip()
-                if net_name in {"SOL","SOLANA"} and (not contract or contract.upper()=="SOL"):
-                    contract = WSOL
-                found = next((ch for ch, cfg in CHAINS.items() if net_name in cfg["aliases"]), None)
-                if not found: continue
-                if not valid_contract(found, contract): continue
-                dedup = norm_addr(found, contract)
-                if dedup in result[found]: continue
-                result[found][dedup] = {
-                    "symbol": sym, "contract": contract, "dedup_key": dedup, "chain": found,
-                    "pair": sym2pair.get(sym, sym + "USDT"), "raw_network": net.get("network"),
-                    "withdraw_fee": fnum(net.get("withdrawFee")), "withdraw_min": fnum(net.get("withdrawMin")),
-                    "withdraw_enable": bool(net.get("withdrawEnable")),
-                    "deposit_enable": bool(net.get("depositEnable")),
-                    "cex": "MEXC", "cex_pair": sym2pair.get(sym, sym + "USDT"),
-                }
-        return {k: list(v.values()) for k, v in result.items()}
-
-class GateCEX(BaseCEX):
-    def __init__(self): super().__init__("GATE")
-    def fetch_pairs(self):
-        r = http_get("https://api.gateio.ws/api/v4/spot/tickers", timeout=15)
-        if not r or r.status_code != 200: return {}
-        out = {}
-        for t in r.json():
-            cp = t.get("currency_pair")
-            if not cp or not cp.endswith("_USDT"): continue
-            base = cp.replace("_USDT","")
-            out[base + "USDT"] = base
-        return out
-    def fetch_tokens(self, pairs):
-        # Gate withdraw status via /withdraw_status? Not public, use config approximation
-        # For V8.9 we map via symbol only, assume withdraw/deposit true
-        result = {k: {} for k in CHAINS}
-        # Use gate chain mapping: need to fetch chain info per coin
-        try:
-            # Gate does not expose contract easily in public, we use MEXC contract as reference
-            # For now, reuse MEXC tokens but tag as GATE if pair exists on Gate
-            pass
-        except:
-            pass
-        return result
-
-class BinanceCEX(BaseCEX):
-    def __init__(self): super().__init__("BINANCE")
-    def fetch_pairs(self):
-        r = http_get("https://api.binance.com/api/v3/exchangeInfo", timeout=15)
-        if not r or r.status_code != 200: return {}
-        out = {}
-        for s in r.json().get("symbols", []):
-            if s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING":
-                out[s["symbol"]] = s["baseAsset"]
-        return out
-    def fetch_tokens(self, pairs):
-        return {k: {} for k in CHAINS}
-
-# Other CEXs - simplified: use ticker list only, contract resolved via MEXC mapping
-class GenericCEX(BaseCEX):
-    def fetch_pairs(self):
-        return {}
-    def fetch_tokens(self, pairs):
-        return {k: {} for k in CHAINS}
-
-
-# Optional API keys for deposit/withdraw check (nếu không có thì mặc định True)
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
-BINANCE_SECRET = os.getenv("BINANCE_SECRET", "")
-GATE_API_KEY = os.getenv("GATE_API_KEY", "")
-GATE_SECRET = os.getenv("GATE_SECRET", "")
-OKX_API_KEY = os.getenv("OKX_API_KEY", "")
-OKX_SECRET = os.getenv("OKX_SECRET", "")
-OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
-BYBIT_SECRET = os.getenv("BYBIT_SECRET", "")
-BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
-BITGET_SECRET = os.getenv("BITGET_SECRET", "")
-BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
-KUCOIN_API_KEY = os.getenv("KUCOIN_API_KEY", "")
-KUCOIN_SECRET = os.getenv("KUCOIN_SECRET", "")
-KUCOIN_PASSPHRASE = os.getenv("KUCOIN_PASSPHRASE", "")
-HTX_API_KEY = os.getenv("HTX_API_KEY", "")
-HTX_SECRET = os.getenv("HTX_SECRET", "")
-BINGX_API_KEY = os.getenv("BINGX_API_KEY", "")
-BINGX_SECRET = os.getenv("BINGX_SECRET", "")
-LBANK_API_KEY = os.getenv("LBANK_API_KEY", "")
-LBANK_SECRET = os.getenv("LBANK_SECRET", "")
-
-def safe_get_deposit_status_public(cex_key, symbol):
-    """Check deposit/withdraw status qua public API nếu có, không cần key"""
-    try:
-        if cex_key == "GATE":
-            # Public: /spot/currencies/{currency}
-            r = http_get(f"https://api.gateio.ws/api/v4/spot/currencies/{symbol}", timeout=5)
-            if r and r.status_code == 200:
-                j = r.json()
-                return not j.get("withdraw_disabled", False), not j.get("deposit_disabled", False)
-        elif cex_key == "KUCOIN":
-            r = http_get(f"https://api.kucoin.com/api/v1/currencies/{symbol}", timeout=5)
-            if r and r.status_code == 200:
-                data = r.json().get("data", {})
-                chains = data.get("chains", [])
-                if chains:
-                    # lấy chain đầu tiên
-                    c = chains[0]
-                    return c.get("isWithdrawEnabled", True), c.get("isDepositEnabled", True)
-        elif cex_key == "HTX":
-            r = http_get(f"https://api.huobi.pro/v1/common/currencys", timeout=5)
-            if r and r.status_code == 200:
-                for cur in r.json().get("data", []):
-                    if cur.get("currency","").upper() == symbol.upper():
-                        # HTX không trả chi tiết chain, mặc định True
-                        return True, True
-        elif cex_key == "OKX":
-            r = http_get(f"https://www.okx.com/api/v5/asset/currencies?ccy={symbol}", timeout=5)
-            if r and r.status_code == 200:
-                for cur in r.json().get("data", []):
-                    if cur.get("ccy") == symbol:
-                        # OKX: canWd, canDep
-                        return cur.get("canWd", True), cur.get("canDep", True)
-    except:
-        pass
-    # Mặc định nếu không check được thì cho qua (True, True) để không miss kèo
-    return True, True
-
-CEX_ADAPTERS = {
-    "MEXC": MexcCEX(),
-    "GATE": GateCEX(),
-    "BINANCE": BinanceCEX(),
-    "OKX": GenericCEX("OKX"),
-    "BYBIT": GenericCEX("BYBIT"),
-    "BITGET": GenericCEX("BITGET"),
-    "LBANK": GenericCEX("LBANK"),
-    "KUCOIN": GenericCEX("KUCOIN"),
-    "BINGX": GenericCEX("BINGX"),
-    "HTX": GenericCEX("HTX"),
-}
-
-class MultiCEXData:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.tokens = {}  # chain -> list
-        self.pairs = {}  # cex -> pairs
-        self.ts = 0
-        self.retry_after = 0
-    def ensure_static(self):
-        with self.lock:
-            now = time.time()
-            if self.tokens and now - self.ts < STATIC_TTL:
-                return
-            if now < self.retry_after:
-                return
-            try:
-                all_tokens = {k: {} for k in CHAINS}
-                all_pairs = {}
-                # Fetch MEXC first (has contract data)
-                mexc_adapter = CEX_ADAPTERS["MEXC"]
-                mexc_pairs = mexc_adapter.fetch_pairs()
-                mexc_tokens = mexc_adapter.fetch_tokens(mexc_pairs)
-                all_pairs["MEXC"] = mexc_pairs
-                for chain, lst in mexc_tokens.items():
-                    for t in lst:
-                        all_tokens[chain][t["dedup_key"]] = t
-                
-                # Fetch other CEXs pairs in parallel (only pairs, contract reuse MEXC)
-                def fetch_other(cex_key):
-                    if cex_key not in ENABLED_CEXS or cex_key=="MEXC":
-                        return cex_key, {}, {}
-                    try:
-                        ad = CEX_ADAPTERS.get(cex_key)
-                        if not ad: return cex_key, {}, {}
-                        pairs = ad.fetch_pairs()
-                        # For other CEX, create token entries reusing MEXC contract if symbol matches
-                        tokens = {k: {} for k in CHAINS}
-                        for pair, base in pairs.items():
-                            # find matching MEXC token by symbol
-                            for chain in CHAINS:
-                                for dedup, mt in all_tokens[chain].items():
-                                    if mt["symbol"]==base:
-                                        # clone with new cex
-                                        nt = dict(mt)
-                                        nt["cex"] = cex_key
-                                        nt["cex_pair"] = pair
-                                        nt["pair"] = pair
-                                        # use CEX registry fee
-                                        tokens[chain][dedup] = nt
-                        return cex_key, pairs, tokens
-                    except Exception as e:
-                        log.warning("CEX %s fetch fail: %s", cex_key, e)
-                        return cex_key, {}, {}
-
-                with _TPE(max_workers=5) as ex:
-                    futures = {ex.submit(fetch_other, k): k for k in ENABLED_CEXS if k!="MEXC"}
-                    for fut in futures:
-                        try:
-                            cex_key, pairs, tokens = fut.result(timeout=15)
-                            all_pairs[cex_key]=pairs
-                            for chain in CHAINS:
-                                for dedup, t in tokens.get(chain, {}).items():
-                                    # avoid overwriting MEXC primary, keep both as separate entries with cex tag
-                                    # store as list later
-                                    if dedup not in all_tokens[chain]:
-                                        all_tokens[chain][dedup]=t
-                                    else:
-                                        # keep both: create composite key
-                                        # For simplicity, if token already exists, add secondary entry with cex suffix
-                                        comp_key = f"{dedup}_{cex_key}"
-                                        all_tokens[chain][comp_key]=t
-                        except Exception as e:
-                            log.warning("CEX parallel fail %s", e)
-
-                # Convert to list
-                final = {k: list(v.values()) for k, v in all_tokens.items()}
-                self.tokens = final
-                self.pairs = all_pairs
-                self.ts = now
-                total = sum(len(v) for v in final.values())
-                log.info("MultiCEX loaded: %d tokens total, CEXs=%s", total, list(all_pairs.keys()))
-            except Exception as e:
-                log.error("MultiCEX refresh fail: %s", e)
-                import traceback; traceback.print_exc()
-                self.retry_after = now + 60
-
-# Replace MexcData with MultiCEX
-class MexcData(MultiCEXData):
-    pass
-
-MEXC = MexcData()
-
-def mexc_depth(symbol):
-    try:
-        return MEXC.get_book().get(symbol)
-    except:
-        return None
-
-
-
-def get_decimals(chain_key, contract):
-    key = (chain_key, norm_addr(chain_key, contract))
-    with DEC_LOCK:
-        if key in DEC_CACHE:
-            return DEC_CACHE[key]
-    dec = None
-    try:
-        if chain_key == "SOL":
-            j = rpc_post(SOL_RPC, {"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [contract]})
-            dec = (((j or {}).get("result") or {}).get("value") or {}).get("decimals")
-        elif CHAINS[chain_key].get("evm") and chain_key in RPC_URLS:
-            j = rpc_post(RPC_URLS[chain_key], {"jsonrpc": "2.0", "id": 1, "method": "eth_call",
-                                               "params": [{"to": contract, "data": "0x313ce567"}, "latest"]})
-            res = (j or {}).get("result")
-            if res and res not in ("0x", "0x0") and len(res) >= 3:
-                dec = int(res, 16)
-    except:
-        pass
-    API.report("rpc", dec is not None)
-    if dec is not None and 0 <= dec <= 36:
-        with DEC_LOCK:
-            DEC_CACHE[key] = int(dec)
-        return int(dec)
-
-def get_sol_transfer_fee(contract):
-    """Lay transfer fee cua Token-2022 (basis points), VD 3% = 300"""
-    try:
-        # getAccountInfo with jsonParsed to read extensions
-        j = rpc_post(SOL_RPC, {"jsonrpc": "2.0", "id": 1, "method": "getAccountInfo", "params": [contract, {"encoding": "jsonParsed"}]})
-        data = (((j or {}).get("result") or {}).get("value") or {}).get("data") or {}
-        if isinstance(data, dict):
-            parsed = data.get("parsed") or {}
-            info = parsed.get("info") or {}
-            exts = info.get("extensions") or []
-            for ext in exts:
-                if ext.get("extension") == "transferFeeConfig":
-                    state = ext.get("state") or {}
-                    fee = state.get("transferFeeConfig") or {}
-                    # newer format
-                    newer = state.get("newerTransferFee") or {}
-                    older = state.get("olderTransferFee") or {}
-                    # try both
-                    bp = newer.get("transferFeeBasisPoints") or older.get("transferFeeBasisPoints") or fee.get("transferFeeBasisPoints")
-                    if bp is not None:
-                        return float(bp)/100.0/100.0  # 300 -> 0.03
-        # fallback: try get token supply extension check
-        j2 = rpc_post(SOL_RPC, {"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [contract]})
-        # no fee info here, return 0
-    except Exception as e:
-        log.debug("transfer fee check loi %s: %s", contract[:8], e)
-    return 0.0
-
-
-def jup_quote(input_mint, output_mint, amount_raw):
-    params = {"inputMint": input_mint, "outputMint": output_mint, "amount": str(int(amount_raw)),
-              "slippageBps": 50, "restrictIntermediateTokens": "true"}
-    endpoints = []
-    if JUPITER_API_KEY:
-        endpoints.append((JUPITER_PRO_URL, {"x-api-key": JUPITER_API_KEY}))
-    endpoints.append((JUPITER_LITE_URL, None))
-    for url, headers in endpoints:
-        r = http_get(url, params=params, headers=headers, limiter=JUP_LIMITER, timeout=8, retries=1)
-        API.report("jupiter", bool(r is not None and r.status_code in (200, 400, 404)))
-        if r is None or r.status_code != 200:
-            continue
-        try:
-            j = r.json()
-            out = fnum(j.get("outAmount"))
-            if out <= 0:
-                continue
-            return {"out": out, "impact": abs(fnum(j.get("priceImpactPct"))) * 100.0}
-        except:
-            continue
-    return None
-
-def paraswap_quote(chain_id, src, dest, amount_raw, src_dec, dest_dec):
-    params = {"srcToken": src, "destToken": dest, "amount": str(int(amount_raw)), "srcDecimals": src_dec,
-              "destDecimals": dest_dec, "side": "SELL", "network": chain_id, "version": "6.2"}
-    r = http_get(PARASWAP_URL, params=params, limiter=PARA_LIMITER, timeout=10, retries=1)
-    API.report("paraswap", bool(r is not None and r.status_code in (200, 400, 404)))
-    if r is None or r.status_code != 200:
-        return None
-    try:
-        pr = r.json().get("priceRoute") or {}
-        out = fnum(pr.get("destAmount"))
-        if out <= 0:
-            return None
-        src_usd, dest_usd = fnum(pr.get("srcUSD")), fnum(pr.get("destUSD"))
-        impact = max(0.0, (src_usd - dest_usd) / src_usd * 100.0) if src_usd > 0 and dest_usd > 0 else None
-        return {"out": out, "impact": impact}
-    except:
-        return None
-
-def dex_buy_quote(chain_key, contract, dec, usd):
-    if chain_key == "SOL":
-        q = jup_quote(SOL_USDC, contract, usd * 1e6)
-        src = "jupiter"
-    else:
-        cid = CHAINS[chain_key]["chain_id"]
-        if cid not in STABLE:
-            return None
-        st, sdec = STABLE[cid]
-        q = paraswap_quote(cid, st, contract, usd * 10 ** sdec, sdec, dec)
-        src = "paraswap"
-    if not q:
-        return None
-    tokens = q["out"] / 10 ** dec
-    if tokens <= 0:
-        return None
-    return {"tokens": tokens, "price": usd / tokens, "impact": q["impact"], "source": src}
-
-def dex_sell_quote(chain_key, contract, dec, tokens):
-    raw = int(tokens * 10 ** dec)
-    if raw <= 0:
-        return None
-    if chain_key == "SOL":
-        q = jup_quote(contract, SOL_USDC, raw)
-        sdec, src = 6, "jupiter"
-    else:
-        cid = CHAINS[chain_key]["chain_id"]
-        if cid not in STABLE:
-            return None
-        st, sdec = STABLE[cid]
-        q = paraswap_quote(cid, contract, st, raw, dec, sdec)
-        src = "paraswap"
-    if not q:
-        return None
-    usd_out = q["out"] / 10 ** sdec
-    if usd_out <= 0:
-        return None
-    return {"usd_out": usd_out, "price": usd_out / tokens, "impact": q["impact"], "source": src}
-
-SEC_CACHE = {}
-SEC_CACHE_MAX = 2000
-SEC_LOCK = threading.Lock()
-HARD_BAD = {"is_honeypot": "honeypot", "cannot_sell_all": "cannot_sell_all", "owner_change_balance": "owner_change_balance"}
-SOFT_FLAGS = ("transfer_pausable", "is_blacklisted", "slippage_modifiable", "hidden_owner", "trading_cooldown",
-              "can_take_back_ownership")
-UNKNOWN_SEC = {"known": False, "buy_tax": 0.0, "sell_tax": 0.0, "bad": None, "soft": []}
-
-def get_security(chain_key, contract):
-    cid = (CHAINS.get(chain_key) or {}).get("chain_id")
-    if cid not in (1, 56, 137, 8453, 42161) or not contract:
-        return dict(UNKNOWN_SEC)
-    key = (chain_key, contract.lower())
-    with SEC_LOCK:
-        c = SEC_CACHE.get(key)
-        if c and time.time() - c[0] < (21600 if c[1]["known"] else 600):
-            return c[1]
-    r = http_get(f"https://api.gopluslabs.io/api/v1/token_security/{cid}", params={"contract_addresses": contract},
-                 limiter=TAX_LIMITER, timeout=10, retries=1)
-    API.report("goplus", bool(r and r.status_code == 200))
-    sec = dict(UNKNOWN_SEC)
-    try:
-        if r and r.status_code == 200:
-            result = r.json().get("result") or {}
-            data = result.get(contract.lower()) or result.get(contract) or {}
-            if data:
-                def tax(k):
-                    v = fnum(data.get(k))
-                    v = v / 100.0 if v > 1 else v
-                    return max(0.0, min(v, 0.5))
-                bad = None
-                for k, name in HARD_BAD.items():
-                    if str(data.get(k)) == "1":
-                        bad = name; break
-                if bad is None and str(data.get("is_open_source")) == "0":
-                    bad = "not_open_source"
-                sec = {"known": data.get("buy_tax") not in (None, "") and data.get("sell_tax") not in (None, ""),
-                       "buy_tax": tax("buy_tax"), "sell_tax": tax("sell_tax"), "bad": bad,
-                       "soft": [f for f in SOFT_FLAGS if str(data.get(f)) == "1"]}
-    except Exception as e:
-        log.warning("GoPlus parse loi %s: %s", contract[:8], e)
-    # V8.2: SOL Token-2022 transfer fee fallback if GoPlus miss
-    if chain_key == "SOL" and sec.get("buy_tax",0) == 0 and sec.get("sell_tax",0) == 0:
-        try:
-            tf = get_sol_transfer_fee(contract)
-            if tf > 0:
-                sec["buy_tax"] = tf
-                sec["sell_tax"] = tf
-                sec["known"] = True
-                log.info("Phat hien transfer fee SOL %s %.2f%%", contract[:8], tf*100)
-        except:
-            pass
-    with SEC_LOCK:
-        SEC_CACHE[key] = (time.time(), sec)
-        if len(SEC_CACHE) > SEC_CACHE_MAX:
-            try:
-                oldest = next(iter(SEC_CACHE))
-                SEC_CACHE.pop(oldest)
-            except:
-                pass
-    return sec
-
-def dex_prices_estimate(pool):
-    impact_pct = 2 * ORDER_SIZE_USD / max(pool["liq"], 1) * 100
-    f, i = pool["fee"], impact_pct / 100
-    return impact_pct, pool["price"] * (1 + f + i), pool["price"] * (1 - f - i)
-
-def risk_buffer(chain_key, pool, sec):
-    tm = get_real_transfer_time(chain_key, pool)
-    move = max(abs(pool.get("chg_m5", 0)) * math.sqrt(tm / 5.0), abs(pool.get("chg_h1", 0)) * math.sqrt(tm / 60.0))
-    buf = RISK_FLOOR + RISK_K * move
-    buf += SOFT_FLAG_BUFFER * len(sec.get("soft", []))
-    if not sec.get("known") and CHAINS[chain_key].get("evm"):
-        buf += UNKNOWN_SEC_BUFFER
-    return buf
-
-# ========= V8.8 NEW FUNCTIONS =========
-def calc_optimal_size(pool_liq, pool_vol24, gross_pct, base_usd=ORDER_SIZE_USD):
-    """Size dong 200-2000$ dua tren thanh khoan"""
-    # muc tieu impact 0.3%
-    target_impact = 0.003
-    # size toi uu = liq * target_impact
-    size_by_liq = pool_liq * target_impact
-    # neu vol cao, cho phep size lon hon
-    vol_factor = min(pool_vol24 / 100000, 2.0)  # vol 100k -> x1, vol 200k+ -> x2
-    size_by_liq *= vol_factor
-    # neu gross cao, tang size 20%
-    if gross_pct > 3:
-        size_by_liq *= 1.5
-    elif gross_pct > 2:
-        size_by_liq *= 1.2
-    size = max(ORDER_SIZE_MIN, min(ORDER_SIZE_MAX, size_by_liq, ORDER_SIZE_MAX))
-    # dam bao it nhat base_usd neu liq du lon
-    if pool_liq > 500000:
-        size = max(size, base_usd)
-    return round(size, 2)
-
-def is_honeypot_simulation(chain_key, contract, dec):
-    """Check honeypot bang cach quote $10 that"""
-    if not dec:
-        return False  # khong check duoc thi cho qua
-    try:
-        if chain_key == "SOL":
-            # thu mua $10 USDC -> token
-            q = jup_quote(SOL_USDC, contract, 10 * 1e6)
-            if not q or q.get("out", 0) <= 0:
-                return True
-            # thu ban nguoc lai token -> USDC (lay 90% token vua mua de tranh dust)
-            out_tokens = q["out"]
-            q2 = jup_quote(contract, SOL_USDC, int(out_tokens * 0.9))
-            if not q2 or q2.get("out", 0) <= 0:
-                return True
-            # neu ban ra mat >50% gia tri -> nghi la honeypot hoac tax cao bat thuong
-            buy_value = 10
-            sell_value = q2["out"] / 1e6
-            if sell_value < buy_value * 0.5:
-                log.info("HONEYPOT SIM %s %s sell %.2f vs buy 10", chain_key, contract[:8], sell_value)
-                return True
-        else:
-            # EVM: dung paraswap quote $100 stable -> token va nguoc lai
-            cid = CHAINS[chain_key]["chain_id"]
-            if cid in STABLE:
-                st, sdec = STABLE[cid]
-                q = paraswap_quote(cid, st, contract, 100 * 10**sdec, sdec, dec)
-                if not q:
-                    return True
-    except Exception as e:
-        log.debug("Honeypot sim loi %s: %s", contract[:8], e)
-    return False
-
-# Real transfer time with volatility decay
-TRANSFER_BASE = {"SOL": 2, "BNB": 3, "BASE": 3, "ETH": 8, "POLYGON": 5, "ARBITRUM": 3}
-LAST_GAS_MULTIPLIER = {}
-
-def get_real_transfer_time(chain_key, pool):
-    """Thoi gian nap/rut thuc te = base + bien dong + tac nghen mang"""
-    base = TRANSFER_BASE.get(chain_key, CHAINS[chain_key].get("transfer_min", 5))
-    # neu pool bien dong manh 5m > 5%, cong them thoi gian rui ro
-    chg = abs(pool.get("chg_m5", 0))
-    if chg > 10:
-        base += 3
-    elif chg > 5:
-        base += 1.5
-    # neu chain ETH gas cao, cong them
-    # (co the doc tu RPC neu can, hien tai dung he so don gian)
-    return base
-
-def calc_ai_score(pool, gross_pct, net_pct, chain_key):
-    """AI Score 0-100 de loc keo ngon"""
-    # 40 diem cho profit
-    profit_score = min(net_pct / 5.0 * 40, 40) if net_pct > 0 else 0
-    # 20 diem cho vol/liq ratio (vol cao so voi liq la tot)
-    vl_ratio = pool["vol24"] / max(pool["liq"], 1)
-    vol_score = min(vl_ratio * 20, 20)  # ratio 1.0 -> 20 diem
-    # 15 diem cho txns h1 (dong)
-    tx_score = min(pool.get("txns_h1", 0) / 100.0 * 15, 15)
-    # 10 diem cho tuoi: token 1-24h duoc diem cao neu la meme moi, token qua gia (>30 ngay) bi tru
-    age_h = pool.get("age_h", 0)
-    if age_h < 2:
-        age_score = 10
-    elif age_h < 24:
-        age_score = 8
-    elif age_h < 168:  # 1 tuan
-        age_score = 5
-    else:
-        age_score = 2
-    # 15 diem cho bien dong (co bien dong moi co co hoi)
-    vola_score = min(abs(pool.get("chg_m5", 0)) * 2, 15)
-    total = profit_score + vol_score + tx_score + age_score + vola_score
-    return round(min(total, 100), 1)
-
-# Volatile tracker - token nao bien dong lien tuc -> de xuat hold inventory
-VOLATILE_TRACKER = {}
-HOT_TOKENS = {}  # {symbol: count}
-VOLATILE_LOCK = threading.Lock()
-
-def track_volatility(tok_symbol, pool, contract=None, chain=None, profit_potential=0):
-    chg = abs(pool.get("chg_m5", 0))
-    if chg >= VOLATILE_CHG_THRESHOLD:
-        with VOLATILE_LOCK:
-            VOLATILE_TRACKER[tok_symbol] = VOLATILE_TRACKER.get(tok_symbol, 0) + 1
-            if VOLATILE_TRACKER[tok_symbol] >= VOLATILE_COUNT_TO_HOT:
-                HOT_TOKENS[tok_symbol] = time.time()
-                # V8.9: auto record to inventory DB
-                try:
-                    INV_DB.record_hot(tok_symbol, contract or "", chain or "", profit_potential)
-                except:
-                    pass
-                return True
-    return False
-
-def should_hold_inventory(symbol):
-    """Check if we should hold inventory on both CEX and DEX for fast arbitrage"""
-    with VOLATILE_LOCK:
-        hits = VOLATILE_TRACKER.get(symbol, 0)
-        return hits >= VOLATILE_COUNT_TO_HOT
-
-def get_inventory_suggestion(symbol, usd_size):
-    """Suggest inventory size based on volatility"""
-    if not should_hold_inventory(symbol):
-        return None
-    # Suggest hold 50% of size on each side
-    # Example: usd_size 500$ -> hold 250$ token on DEX + 250$ USDT on CEX
-    return {
-        "dex_hold_usd": usd_size * 0.5,
-        "cex_hold_usd": usd_size * 0.5,
-        "reason": f"HOT token {symbol} volatil {VOLATILE_TRACKER.get(symbol)} times"
-    }
-
-def is_hot_token(symbol):
-    with VOLATILE_LOCK:
-        ts = HOT_TOKENS.get(symbol)
-        if not ts:
-            return False
-        # hot trong 2h
-        if time.time() - ts < 7200:
-            return True
-        else:
-            HOT_TOKENS.pop(symbol, None)
-            return False
-
-# Multi-CEX registry
-CEX_REGISTRY = {
-    "MEXC": {"name": "MEXC", "taker": 0.002, "maker": 0.0, "withdraw_fees": "mexc", "ws": "wss://wbs.mexc.com/ws"},
-    "GATE": {"name": "Gate.io", "taker": 0.002, "maker": 0.002, "api": "https://api.gateio.ws/api/v4", "ws": "wss://api.gateio.ws/ws/v4/"},
-    "BINANCE": {"name": "Binance", "taker": 0.001, "maker": 0.0005, "api": "https://api.binance.com", "ws": "wss://stream.binance.com:9443/ws"},
-    "OKX": {"name": "OKX", "taker": 0.001, "maker": 0.0008, "api": "https://www.okx.com", "ws": "wss://ws.okx.com:8443/ws/v5/public"},
-    "BYBIT": {"name": "Bybit", "taker": 0.001, "maker": 0.0005},
-    "BITGET": {"name": "Bitget", "taker": 0.002, "maker": 0.002},
-    "KUCOIN": {"name": "KuCoin", "taker": 0.001, "maker": 0.001},
-    "BINGX": {"name": "BingX", "taker": 0.002, "maker": 0.002},
-    "HTX": {"name": "HTX", "taker": 0.002, "maker": 0.002},
-    "LBANK": {"name": "LBank", "taker": 0.002, "maker": 0.002},
-}
-
-
-def evaluate(chain_key, tok, pool, depth):
-    cfg = CHAINS[chain_key]
-    st = STATS[chain_key]
-    # V8.8: dynamic size 200-2000$
-    # tinh size dua tren liq truoc khi tinh toan chinh
-    # su dung gross tam tinh de tinh size
-    bids, asks = depth["bids"], depth["asks"]
-    if (asks[0][0] - bids[0][0]) / asks[0][0] * 100 > MAX_MEXC_SPREAD:
-        return []
-    
-    # === DEPOSIT/WITHDRAW FILTER V8.9.1 ===
-    # Nếu sàn đóng nạp/rút thì bỏ qua chiều đó
-    # (đã được check ở trên nhưng double check ở đây cho an toàn)
-    
-    # === NEW MEMECOIN FILTER V8.8 ===
-    age_h = pool.get("age_h", 0)
-    if age_h < MIN_POOL_AGE_H:
-        if not ALLOW_NEW_MEME:
-            return []
-        # cho phep meme moi neu vol va txns cao
-        if not (pool["vol24"] >= 100000 and pool.get("txns_h1",0) >= 50):
-            # neu la meme cuc moi (<2h) thi yeu cau vol cao hon
-            if age_h < MIN_POOL_AGE_MEME_H:
-                return []
-            # vol trung binh van cho phep neu gross du lon
-            if pool["vol24"] < 50000:
-                return []
-        # memecoin moi thi tang buffer
-        extra_meme_buffer = 0.5
-    else:
-        extra_meme_buffer = 0
-
-    sec = get_security(chain_key, tok["contract"])
-    if sec["bad"] or sec["buy_tax"] > TAX_MAX or sec["sell_tax"] > TAX_MAX:
-        st.inc("suspect")
-        log.info("LOAI SECURITY %s %s bad=%s buy %.1f%% sell %.1f%%", chain_key, tok["symbol"], sec["bad"],
-                 sec["buy_tax"] * 100, sec["sell_tax"] * 100)
-        return []
-    buy_tax, sell_tax = sec["buy_tax"], sec["sell_tax"]
-    dec = get_decimals(chain_key, tok["contract"]) if (REAL_PRICE_CHECK and chain_key in REAL_CHAINS) else None
-    can_real = dec is not None
-    if not can_real and REQUIRE_REAL_PRICE and chain_key in REAL_CHAINS:
-        st.inc("real_price_fail")
-        return []
-    impact_est, buy_est, sell_est = dex_prices_estimate(pool)
-    if not can_real and impact_est > MAX_IMPACT_PCT * 1.5:
-        return []
-    buf = risk_buffer(chain_key, pool, sec) + extra_meme_buffer
-    
-    # === HONEYPOT SIMULATION V8.8 ===
-    if can_real and dec:
-        if is_honeypot_simulation(chain_key, tok["contract"], dec):
-            st.inc("suspect")
-            log.info("LOAI HONEYPOT SIM %s %s", chain_key, tok["symbol"])
-            return []
-
-    # === MAKER vs TAKER LOGIC V8.8 ===
-    # Tinh depth: tong volume bid/ask trong 1% gia
-    # Neu depth du lon -> dung maker fee 0%, neu khong -> taker 0.2%
-    def calc_depth_usd(orders, price_ref, pct=0.01):
-        total = 0
-        for price, qty in orders[:10]:
-            if abs(price - price_ref)/price_ref <= pct:
-                total += price * qty
-            else:
-                break
-        return total
-    best_bid, best_ask = bids[0][0], asks[0][0]
-    mid = (best_bid + best_ask)/2
-    bid_depth_usd = calc_depth_usd(bids, best_bid)
-    ask_depth_usd = calc_depth_usd(asks, best_ask)
-    
-    # Tinh size dong truoc
-    # Dung gross tam de tinh size, sau do tinh lai chinh xac
-    gross_est_mexc_to_dex = (sell_est / best_ask -1)*100 if best_ask else 0
-    gross_est_dex_to_mexc = (best_bid / buy_est -1)*100 if buy_est else 0
-    avg_gross_est = max(gross_est_mexc_to_dex, gross_est_dex_to_mexc, 1.0)
-    usd_dynamic = calc_optimal_size(pool["liq"], pool["vol24"], avg_gross_est, ORDER_SIZE_USD)
-    gas = cfg["gas_usd"]
-    
-    # Quyet dinh maker/taker dua tren depth
-    # Neu depth >= size * MULTIPLIER -> co the dat maker
-    can_maker = min(bid_depth_usd, ask_depth_usd) >= usd_dynamic * MAKER_DEPTH_MULTIPLIER
-    
-    if can_maker:
-        mexc_fee_use = MEXC_MAKER_FEE
-        fee_type = "maker"
-    else:
-        mexc_fee_use = MEXC_TAKER_FEE
-        fee_type = "taker"
-
-    common = {"mexc_best": (bids[0][0], asks[0][0]), "buy_tax": buy_tax, "sell_tax": sell_tax,
-              "withdraw_enable": tok.get("withdraw_enable"), "deposit_enable": tok.get("deposit_enable"),
-              "risk_buf": buf, "sec_known": sec["known"], "sec_soft": sec["soft"], "decimals": dec,
-              "usd_size": usd_dynamic, "fee_type": fee_type, "mexc_fee": mexc_fee_use,
-              "transfer_min_real": get_real_transfer_time(chain_key, pool)}
+# ============================ SO LENH ============================
+def clean_levels(raw, mult=1.0):
     out = []
-    if tok.get("withdraw_enable", True):
-        w = walk_usd(asks, usd_dynamic)
-        if w:
-            avg, tokens = w
-            tokens_net = tokens - tok["withdraw_fee"]
-            if tokens_net > 0 and tokens >= tok["withdraw_min"]:
-                q = dex_sell_quote(chain_key, tok["contract"], dec, tokens_net) if can_real else None
-                if q:
-                    st.inc("real_price_ok")
-                    usd_out, impact, src = q["usd_out"], q["impact"], q["source"]
-                    if impact is None:
-                        impact = impact_est
-                elif REQUIRE_REAL_PRICE and chain_key in REAL_CHAINS:
-                    st.inc("real_price_fail")
-                    usd_out = None
-                else:
-                    usd_out, impact, src = tokens_net * sell_est, impact_est, "estimate"
-                if usd_out:
-                    sell_px = usd_out / tokens_net
-                    gross = (sell_px / avg - 1) * 100
-                    cost = usd_dynamic * (1 + mexc_fee_use)
-                    revenue = usd_out * (1 - EXTRA_SLIPPAGE) * (1 - sell_tax) - gas
-                    net = revenue - cost
-                    net_pct = net / cost * 100
-                    real_impact = max(impact or 0, impact_est)
-                    # volatility decay
-                    decay = abs(pool.get("chg_m5",0)) * 0.1
-                    net_pct_decayed = net_pct - decay
-                    if -5 < gross <= MAX_GROSS and real_impact <= MAX_IMPACT_PCT and impact <= 2.5:
-                        if abs(sell_px - pool["price"]) / pool["price"] > 0.12:
-                            st.inc("suspect")
-                        else:
-                            ai = calc_ai_score(pool, gross, net_pct_decayed, chain_key)
-                            if ai >= AI_SCORE_MIN:
-                                # track volatility for inventory
-                                is_hot = track_volatility(tok["symbol"], pool, tok.get("contract"), chain_key, net_pct_decayed)
-                                out.append(dict(common, direction="MEXC_TO_DEX", token_amount=tokens,
-                                                token_after_tax=tokens_net * (1 - sell_tax), mexc_avg=avg,
-                                                dex_exec=sell_px, cost=cost, net_usd=net, net_pct=net_pct_decayed,
-                                                adj_net_pct=net_pct_decayed - buf, gross_pct=gross,
-                                                gross_after_tax=gross - sell_tax * 100, gas=gas,
-                                                withdraw_fee_usd=tok["withdraw_fee"] * avg, impact_dex=real_impact,
-                                                real_source=src, ai_score=ai, is_hot=is_hot))
-    if tok.get("deposit_enable", True):
-        q = dex_buy_quote(chain_key, tok["contract"], dec, usd_dynamic) if can_real else None
-        if q:
-            st.inc("real_price_ok")
-            tokens_out, buy_px, impact, src = q["tokens"], q["price"], q["impact"], q["source"]
-            if impact is None:
-                impact = impact_est
-        elif REQUIRE_REAL_PRICE and chain_key in REAL_CHAINS:
-            st.inc("real_price_fail")
-            tokens_out = None
-        else:
-            buy_px, impact, src = buy_est, impact_est, "estimate"
-            tokens_out = usd_dynamic / buy_est
-        if tokens_out:
-            tokens_dep = tokens_out * (1 - EXTRA_SLIPPAGE) * (1 - buy_tax)
-            proceeds = walk_tokens(bids, tokens_dep)
-            if proceeds:
-                cost = usd_dynamic + gas * 2
-                revenue = proceeds * (1 - mexc_fee_use)
-                net = revenue - cost
-                avg = proceeds / tokens_dep
-                gross = (avg / buy_px - 1) * 100
-                net_pct = net / cost * 100
-                real_impact = max(impact or 0, impact_est)
-                decay = abs(pool.get("chg_m5",0)) * 0.1
-                net_pct_decayed = net_pct - decay
-                if -5 < gross <= MAX_GROSS and real_impact <= MAX_IMPACT_PCT and impact <= 2.5:
-                    if abs(buy_px - pool["price"]) / pool["price"] > 0.12:
-                        st.inc("suspect")
-                    else:
-                        ai = calc_ai_score(pool, gross, net_pct_decayed, chain_key)
-                        if ai >= AI_SCORE_MIN:
-                            is_hot = track_volatility(tok["symbol"], pool, tok.get("contract"), chain_key, net_pct_decayed)
-                            out.append(dict(common, direction="DEX_TO_MEXC", token_amount=tokens_dep,
-                                            token_raw=tokens_out, mexc_avg=avg, dex_exec=buy_px, cost=cost,
-                                            net_usd=net, net_pct=net_pct_decayed, adj_net_pct=net_pct_decayed - buf,
-                                            gross_pct=gross, gross_after_tax=gross - buy_tax * 100, gas=gas * 2,
-                                            withdraw_fee_usd=0.0, impact_dex=real_impact, real_source=src,
-                                            ai_score=ai, is_hot=is_hot))
+    for lv in raw or []:
+        try:
+            if isinstance(lv, dict): p, q = float(lv.get("price") or lv.get("p")), float(lv.get("amount") or lv.get("quantity") or lv.get("q"))
+            else: p, q = float(lv[0]), float(lv[1])
+        except Exception: continue
+        if p > 0 and q > 0: out.append((p / mult, q * mult))
+    return out
+def make_depth(bids, asks):
+    bids = sorted(bids, key=lambda x: -x[0]); asks = sorted(asks, key=lambda x: x[0])
+    if len(bids) < 3 or len(asks) < 3 or asks[0][0] <= bids[0][0]: return None
+    return {"bids": bids, "asks": asks}
+def scale_depth(d, mult):
+    if not d or mult == 1.0: return d
+    return {"bids": [(p / mult, q * mult) for p, q in d["bids"]], "asks": [(p / mult, q * mult) for p, q in d["asks"]]}
+def walk_usd(levels, usd):
+    """Mua bang usd tren asks -> (gia TB, so token) hoac None neu so lenh khong du."""
+    left, tok = usd, 0.0
+    for p, q in levels:
+        take = min(left, p * q); tok += take / p; left -= take
+        if left <= 1e-9: break
+    return (usd / tok, tok) if left <= usd * 1e-6 and tok > 0 else None
+def walk_tokens(levels, tokens):
+    """Ban tokens vao bids -> so USD nhan hoac None neu so lenh khong hap thu het."""
+    left, usd = tokens, 0.0
+    for p, q in levels:
+        take = min(left, q); usd += take * p; left -= take
+        if left <= tokens * 1e-9: break
+    return usd if left <= tokens * 1e-6 else None
+def depth_usd(levels, within_pct):
+    if not levels: return 0.0
+    ref, tot = levels[0][0], 0.0
+    for p, q in levels:
+        if abs(p - ref) / ref * 100 > within_pct: break
+        tot += p * q
+    return tot
+
+# ============================ CEX ADAPTERS ============================
+def make_listing(cex, sym, chain, contract, pair, raw_net, wfee, wmin, wd, dep):
+    if chain == "SOL" and sym == "SOL" and not contract: contract = WSOL
+    contract = contract.strip() if contract else ""
+    if contract and not valid_contract(chain, contract): contract = ""
+    return {"cex": cex, "symbol": sym, "chain": chain, "contract": contract, "key": norm_addr(chain, contract) if contract else "",
+            "cex_pair": pair, "raw_network": raw_net or "", "withdraw_fee": wfee, "withdraw_min": wmin or 0.0,
+            "withdraw_enable": wd, "deposit_enable": dep, "inferred": False}
+def add_listing(out, seen, t):
+    if norm_sym(t["symbol"]) in EXCLUDE_SYMBOLS: return
+    k = (t["chain"], t["key"] or t["symbol"], t["symbol"])
+    if k in seen: return
+    seen.add(k); out.append(t)
+
+class Exchange:
+    name = ""; status_source = "none"   # signed | public | none
+    def __init__(self):
+        self._book, self._book_ts = {}, 0.0; self._lock = threading.Lock(); self.fees = {}; self.native = {}; self.futures = set()
+    @property
+    def lim(self): return LIMITERS[self.name]
+    def load_pairs(self): return {}
+    def load_networks(self, pairs): return None
+    def load_book(self): return {}
+    def raw_depth(self, pair): return None
+    def load_futures(self): return set()
+    def to_native(self, pair): return pair
+    def nat(self, pair): return self.native.get(pair) or self.to_native(pair)
+    def taker_fee(self, pair): return self.fees.get(pair, TAKER_FEE[self.name])
+    def trade_url(self, pair): return ""
+    def depth(self, pair):
+        try: return self.raw_depth(pair)
+        except Exception as e: log.debug("%s depth %s loi %s", self.name, pair, e); return None
+    def get_book(self):
+        with self._lock:
+            if self._book and time.time() - self._book_ts < BOOK_TTL: return self._book
+            try: b = self.load_book()
+            except Exception as e: log.warning("%s book loi %s", self.name, e); b = {}
+            if b: self._book, self._book_ts = b, time.time()
+            return self._book
+def _sym2pair(pairs):
+    d = {}
+    for p, s in pairs.items(): d.setdefault(s, p)
+    return d
+
+def signed_query(secret, params, algo=hashlib.sha256):
+    qs = urlencode(params); return qs, hmac.new(secret.encode(), qs.encode(), algo).hexdigest()
+
+# ---- MEXC ----
+class MexcEx(Exchange):
+    name = "MEXC"; BASE = "https://api.mexc.com"
+    status_source = "signed" if has_key("MEXC") else "none"
+    def load_pairs(self):
+        r = http_get(f"{self.BASE}/api/v3/exchangeInfo", limiter=self.lim, timeout=25)
+        syms = jget(r, "symbols")
+        if syms is None: raise http_err(r, "MEXC exchangeInfo")
+        return {s["symbol"]: s["baseAsset"] for s in syms if s.get("quoteAsset") == "USDT" and str(s.get("status")) in ("1", "ENABLED", "TRADING") and s.get("isSpotTradingAllowed", True)}
+    def load_networks(self, pairs):
+        if not has_key("MEXC"): return None
+        k, sec, _ = KEYS["MEXC"]
+        qs, sig = signed_query(sec, {"recvWindow": 10000, "timestamp": int(time.time() * 1000)})
+        r = http_get(f"{self.BASE}/api/v3/capital/config/getall?{qs}&signature={sig}", headers={"X-MEXC-APIKEY": k}, limiter=self.lim, timeout=25)
+        data = jget(r)
+        if not isinstance(data, list): raise http_err(r, "MEXC capital/config (kiem tra API key)")
+        bases = set(pairs.values()); s2p = _sym2pair(pairs); out, seen = [], set()
+        for coin in data:
+            sym = coin.get("coin")
+            if sym not in bases: continue
+            for net in coin.get("networkList") or []:
+                ch = find_chain(net.get("netWork"), net.get("network"), net.get("name"))
+                if not ch: continue
+                add_listing(out, seen, make_listing("MEXC", sym, ch, net.get("contract"), s2p[sym], net.get("network") or net.get("netWork"),
+                                                    fnum_or_none(net.get("withdrawFee")), fnum(net.get("withdrawMin")), as_bool(net.get("withdrawEnable")), as_bool(net.get("depositEnable"))))
+        return out
+    def load_book(self):
+        r = http_get(f"{self.BASE}/api/v3/ticker/bookTicker", limiter=self.lim, timeout=25); book = {}
+        for t in jget(r, default=[]) or []:
+            bid, ask = fnum(t.get("bidPrice")), fnum(t.get("askPrice"))
+            if 0 < bid < ask and t.get("symbol", "").endswith("USDT"): book[t["symbol"]] = (bid, ask, None)
+        return book
+    def raw_depth(self, pair):
+        j = jget(http_get(f"{self.BASE}/api/v3/depth", params={"symbol": pair, "limit": 200}, limiter=self.lim, timeout=12))
+        return make_depth(clean_levels(j.get("bids")), clean_levels(j.get("asks"))) if j else None
+    def load_futures(self):
+        d = jget(http_get("https://contract.mexc.com/api/v1/contract/detail", limiter=self.lim, timeout=25), "data", default=[])
+        return {x.get("baseCoin") for x in d if x.get("quoteCoin") == "USDT" and x.get("state", 0) == 0}
+    def trade_url(self, pair): return f"https://www.mexc.com/exchange/{base_of(pair)}_USDT"
+
+# ---- GATE ----
+class GateEx(Exchange):
+    name = "GATE"; BASE = "https://api.gateio.ws/api/v4"; status_source = "public"
+    def to_native(self, pair): return f"{base_of(pair)}_USDT"
+    def load_pairs(self):
+        r = http_get(f"{self.BASE}/spot/currency_pairs", limiter=self.lim, timeout=25); d = jget(r)
+        if not isinstance(d, list): raise http_err(r, "Gate currency_pairs")
+        out = {}
+        for p in d:
+            if p.get("quote") == "USDT" and p.get("trade_status") == "tradable":
+                pair = f"{p['base']}USDT"; out[pair] = p["base"]; self.native[pair] = p["id"]
+                f = fnum(p.get("fee")) / 100.0
+                if f > 0: self.fees[pair] = f
+        return out
+    def _withdraw_fees(self):
+        if not has_key("GATE"): return {}
+        k, sec, _ = KEYS["GATE"]; path = "/wallet/withdraw_status"; ts = str(int(time.time()))
+        s = f"GET\n/api/v4{path}\n\n{hashlib.sha512(b'').hexdigest()}\n{ts}"
+        sign = hmac.new(sec.encode(), s.encode(), hashlib.sha512).hexdigest()
+        d = jget(http_get(f"{self.BASE}{path}", headers={"KEY": k, "Timestamp": ts, "SIGN": sign}, limiter=self.lim, timeout=25), default=[])
+        out = {}
+        for row in d or []:
+            per = row.get("withdraw_fix_on_chains") or {}; mini = fnum(row.get("withdraw_amount_mini"))
+            dd = {c: (fnum(v), mini) for c, v in per.items()}
+            if not dd and row.get("withdraw_fix") is not None: dd["*"] = (fnum(row.get("withdraw_fix")), mini)
+            out[row.get("currency")] = dd
+        return out
+    def load_networks(self, pairs):
+        r = http_get(f"{self.BASE}/spot/currencies", limiter=self.lim, timeout=30); d = jget(r)
+        if not isinstance(d, list): raise http_err(r, "Gate currencies")
+        wf = self._withdraw_fees(); bases = set(pairs.values()); s2p = _sym2pair(pairs); out, seen = [], set()
+        for c in d:
+            sym = c.get("currency")
+            if sym not in bases or c.get("delisted"): continue
+            top_wd_off, top_dep_off = as_bool(c.get("withdraw_disabled")), as_bool(c.get("deposit_disabled"))
+            for chn in c.get("chains") or []:
+                ch = find_chain(chn.get("name"))
+                if not ch: continue
+                per = wf.get(sym, {}); fm = per.get(chn.get("name")) or per.get("*")
+                add_listing(out, seen, make_listing("GATE", sym, ch, chn.get("addr"), s2p[sym], chn.get("name"), fm[0] if fm else None, fm[1] if fm else 0.0,
+                                                    (not top_wd_off) and not as_bool(chn.get("withdraw_disabled")), (not top_dep_off) and not as_bool(chn.get("deposit_disabled"))))
+        return out
+    def load_book(self):
+        book = {}
+        for t in jget(http_get(f"{self.BASE}/spot/tickers", limiter=self.lim, timeout=25), default=[]) or []:
+            cp = t.get("currency_pair", "")
+            if not cp.endswith("_USDT"): continue
+            bid, ask = fnum(t.get("highest_bid")), fnum(t.get("lowest_ask"))
+            if 0 < bid < ask: book[cp.replace("_", "")] = (bid, ask, fnum(t.get("quote_volume")))
+        return book
+    def raw_depth(self, pair):
+        j = jget(http_get(f"{self.BASE}/spot/order_book", params={"currency_pair": self.nat(pair), "limit": 200}, limiter=self.lim, timeout=12))
+        return make_depth(clean_levels(j.get("bids")), clean_levels(j.get("asks"))) if j else None
+    def load_futures(self):
+        d = jget(http_get(f"{self.BASE}/futures/usdt/contracts", limiter=self.lim, timeout=25), default=[])
+        return {x["name"][:-5] for x in d or [] if x.get("name", "").endswith("_USDT") and not x.get("in_delisting")}
+    def trade_url(self, pair): return f"https://www.gate.com/trade/{self.nat(pair)}"
+
+# ---- BYBIT ----
+class BybitEx(Exchange):
+    name = "BYBIT"; BASES = ["https://api.bybit.com", "https://api.bytick.com"]
+    status_source = "signed" if has_key("BYBIT") else "none"
+    def _get(self, path, params=None, headers=None, timeout=20):
+        r = None
+        for b in self.BASES:
+            r = http_get(b + path, params=params, headers=headers, limiter=self.lim, timeout=timeout)
+            if r is not None and r.status_code == 200: return r
+        return r
+    def load_pairs(self):
+        r = self._get("/v5/market/instruments-info", {"category": "spot", "limit": 1000}); lst = jget(r, "result", "list")
+        if lst is None: raise http_err(r, "Bybit instruments")
+        return {f"{s['baseCoin']}USDT": s["baseCoin"] for s in lst if s.get("quoteCoin") == "USDT" and s.get("status") == "Trading"}
+    def load_networks(self, pairs):
+        if not has_key("BYBIT"): return None
+        k, sec, _ = KEYS["BYBIT"]; ts = str(int(time.time() * 1000)); recv = "10000"
+        sign = hmac.new(sec.encode(), (ts + k + recv).encode(), hashlib.sha256).hexdigest()
+        r = self._get("/v5/asset/coin/query-info", headers={"X-BAPI-API-KEY": k, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv, "X-BAPI-SIGN": sign}, timeout=30)
+        if jget(r, "retCode") not in (0, "0"): raise http_err(r, f"Bybit coin/query-info retCode={jget(r, 'retCode')} {jget(r, 'retMsg')}")
+        bases = set(pairs.values()); s2p = _sym2pair(pairs); out, seen = [], set()
+        for coin in jget(r, "result", "rows", default=[]) or []:
+            sym = coin.get("coin")
+            if sym not in bases: continue
+            for n in coin.get("chains") or []:
+                ch = find_chain(n.get("chain"), n.get("chainType"))
+                if not ch: continue
+                wd = as_bool(n.get("chainWithdraw")) if "chainWithdraw" in n else None
+                dep = as_bool(n.get("chainDeposit")) if "chainDeposit" in n else None
+                add_listing(out, seen, make_listing("BYBIT", sym, ch, n.get("contractAddress"), s2p[sym], n.get("chainType") or n.get("chain"),
+                                                    fnum_or_none(n.get("withdrawFee")), fnum(n.get("withdrawMin")), wd, dep))
+        return out
+    def load_book(self):
+        book = {}
+        for t in jget(self._get("/v5/market/tickers", {"category": "spot"}), "result", "list", default=[]) or []:
+            s = t.get("symbol", "")
+            bid, ask = fnum(t.get("bid1Price")), fnum(t.get("ask1Price"))
+            if s.endswith("USDT") and 0 < bid < ask: book[s] = (bid, ask, fnum(t.get("turnover24h")))
+        return book
+    def raw_depth(self, pair):
+        j = jget(self._get("/v5/market/orderbook", {"category": "spot", "symbol": pair, "limit": 200}, timeout=12), "result")
+        return make_depth(clean_levels(j.get("b")), clean_levels(j.get("a"))) if j else None
+    def load_futures(self):
+        lst = jget(self._get("/v5/market/instruments-info", {"category": "linear", "limit": 1000}), "result", "list", default=[])
+        return {x.get("baseCoin") for x in lst or [] if x.get("quoteCoin") == "USDT" and x.get("status") == "Trading" and x.get("contractType") == "LinearPerpetual"}
+    def trade_url(self, pair): return f"https://www.bybit.com/en/trade/spot/{base_of(pair)}/USDT"
+
+# ---- BINANCE ----
+class BinanceEx(Exchange):
+    name = "BINANCE"; BASE = "https://api.binance.com"; PUBLIC = ["https://api.binance.com", "https://data-api.binance.vision"]
+    status_source = "signed" if has_key("BINANCE") else "none"
+    def _pub(self, path, params=None, timeout=20):
+        r = None
+        for b in self.PUBLIC:
+            r = http_get(b + path, params=params, limiter=self.lim, timeout=timeout)
+            if r is not None and r.status_code == 200: return r
+        return r
+    def load_pairs(self):
+        r = self._pub("/api/v3/exchangeInfo", {"permissions": "SPOT"}, timeout=30); syms = jget(r, "symbols")
+        if syms is None: raise http_err(r, "Binance exchangeInfo")
+        return {s["symbol"]: s["baseAsset"] for s in syms if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"}
+    def load_networks(self, pairs):
+        if not has_key("BINANCE"): return None
+        k, sec, _ = KEYS["BINANCE"]
+        qs, sig = signed_query(sec, {"timestamp": int(time.time() * 1000), "recvWindow": 10000})
+        r = http_get(f"{self.BASE}/sapi/v1/capital/config/getall?{qs}&signature={sig}", headers={"X-MBX-APIKEY": k}, limiter=self.lim, timeout=30); d = jget(r)
+        if not isinstance(d, list): raise http_err(r, "Binance capital/config (kiem tra API key / IP)")
+        bases = set(pairs.values()); s2p = _sym2pair(pairs); out, seen = [], set()
+        for coin in d:
+            sym = coin.get("coin")
+            if sym not in bases: continue
+            for n in coin.get("networkList") or []:
+                ch = find_chain(n.get("network"), n.get("name"))
+                if not ch: continue
+                add_listing(out, seen, make_listing("BINANCE", sym, ch, n.get("contractAddress"), s2p[sym], n.get("network"),
+                                                    fnum_or_none(n.get("withdrawFee")), fnum(n.get("withdrawMin")), as_bool(n.get("withdrawEnable")), as_bool(n.get("depositEnable"))))
+        return out
+    def load_book(self):
+        book = {}
+        for t in jget(self._pub("/api/v3/ticker/bookTicker", timeout=25), default=[]) or []:
+            s = t.get("symbol", ""); bid, ask = fnum(t.get("bidPrice")), fnum(t.get("askPrice"))
+            if s.endswith("USDT") and 0 < bid < ask: book[s] = (bid, ask, None)
+        return book
+    def raw_depth(self, pair):
+        j = jget(self._pub("/api/v3/depth", {"symbol": pair, "limit": 200}, timeout=12))
+        return make_depth(clean_levels(j.get("bids")), clean_levels(j.get("asks"))) if j else None
+    def load_futures(self):
+        syms = jget(http_get("https://fapi.binance.com/fapi/v1/exchangeInfo", limiter=self.lim, timeout=25), "symbols", default=[])
+        return {x.get("baseAsset") for x in syms or [] if x.get("quoteAsset") == "USDT" and x.get("contractType") == "PERPETUAL" and x.get("status") == "TRADING"}
+    def trade_url(self, pair): return f"https://www.binance.com/en/trade/{base_of(pair)}_USDT?type=spot"
+
+# ---- OKX ----
+class OkxEx(Exchange):
+    name = "OKX"; BASE = "https://www.okx.com"
+    status_source = "signed" if has_key("OKX") else "none"
+    def to_native(self, pair): return f"{base_of(pair)}-USDT"
+    def _tickers(self): return jget(http_get(f"{self.BASE}/api/v5/market/tickers", params={"instType": "SPOT"}, limiter=self.lim, timeout=25), "data", default=None)
+    def load_pairs(self):
+        r = http_get(f"{self.BASE}/api/v5/public/instruments", params={"instType": "SPOT"}, limiter=self.lim, timeout=25); d = jget(r, "data")
+        if d is None: raise http_err(r, "OKX instruments")
+        out = {}
+        for x in d:
+            if x.get("quoteCcy") == "USDT" and x.get("state") == "live":
+                pair = f"{x['baseCcy']}USDT"; out[pair] = x["baseCcy"]; self.native[pair] = x["instId"]
+        return out
+    def load_networks(self, pairs):
+        if not has_key("OKX"): return None
+        k, sec, pp = KEYS["OKX"]; path = "/api/v5/asset/currencies"
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        sign = base64.b64encode(hmac.new(sec.encode(), (ts + "GET" + path).encode(), hashlib.sha256).digest()).decode()
+        r = http_get(self.BASE + path, headers={"OK-ACCESS-KEY": k, "OK-ACCESS-SIGN": sign, "OK-ACCESS-TIMESTAMP": ts, "OK-ACCESS-PASSPHRASE": pp}, limiter=self.lim, timeout=30)
+        d = jget(r, "data")
+        if d is None: raise http_err(r, f"OKX asset/currencies {jget(r, 'msg', default='')}")
+        bases = set(pairs.values()); s2p = _sym2pair(pairs); out, seen = [], set()
+        for row in d:
+            sym = row.get("ccy")
+            if sym not in bases: continue
+            craw = row.get("chain") or ""; net = craw.split("-", 1)[1] if "-" in craw else craw
+            ch = find_chain(net)
+            if not ch: continue
+            fee = fnum_or_none(row.get("fee")) if row.get("fee") not in (None, "") else fnum_or_none(row.get("minFee"))
+            add_listing(out, seen, make_listing("OKX", sym, ch, row.get("ctAddr"), s2p[sym], craw, fee, fnum(row.get("minWd")), as_bool(row.get("canWd")), as_bool(row.get("canDep"))))
+        return out
+    def load_book(self):
+        book = {}
+        for t in self._tickers() or []:
+            inst = t.get("instId", "")
+            if not inst.endswith("-USDT"): continue
+            bid, ask = fnum(t.get("bidPx")), fnum(t.get("askPx"))
+            if 0 < bid < ask: book[inst.replace("-", "")] = (bid, ask, fnum(t.get("volCcy24h")))
+        return book
+    def raw_depth(self, pair):
+        d = jget(http_get(f"{self.BASE}/api/v5/market/books", params={"instId": self.nat(pair), "sz": 200}, limiter=self.lim, timeout=12), "data", 0)
+        return make_depth(clean_levels(d.get("bids")), clean_levels(d.get("asks"))) if d else None
+    def load_futures(self):
+        d = jget(http_get(f"{self.BASE}/api/v5/public/instruments", params={"instType": "SWAP"}, limiter=self.lim, timeout=25), "data", default=[])
+        return {x["instId"].split("-")[0] for x in d or [] if x.get("instId", "").endswith("-USDT-SWAP") and x.get("state") == "live"}
+    def trade_url(self, pair): return f"https://www.okx.com/trade-spot/{self.nat(pair).lower()}"
+
+# ---- KUCOIN ----
+class KucoinEx(Exchange):
+    name = "KUCOIN"; BASE = "https://api.kucoin.com"; status_source = "public"
+    def to_native(self, pair): return f"{base_of(pair)}-USDT"
+    def load_pairs(self):
+        r = http_get(f"{self.BASE}/api/v2/symbols", limiter=self.lim, timeout=25); d = jget(r, "data")
+        if d is None: raise http_err(r, "KuCoin symbols")
+        out = {}
+        for s in d:
+            if s.get("quoteCurrency") == "USDT" and as_bool(s.get("enableTrading"), True):
+                pair = f"{s['baseCurrency']}USDT"; out[pair] = s["baseCurrency"]; self.native[pair] = s["symbol"]
+        return out
+    def load_networks(self, pairs):
+        r = http_get(f"{self.BASE}/api/v3/currencies", limiter=self.lim, timeout=30); d = jget(r, "data")
+        if d is None: raise http_err(r, "KuCoin currencies")
+        bases = set(pairs.values()); s2p = _sym2pair(pairs); out, seen = [], set()
+        for coin in d:
+            sym = coin.get("currency")
+            if sym not in bases: continue
+            for c in coin.get("chains") or []:
+                ch = find_chain(c.get("chainName"), c.get("chainId"))
+                if not ch: continue
+                wd = as_bool(c.get("isWithdrawEnabled")) if "isWithdrawEnabled" in c else None
+                dep = as_bool(c.get("isDepositEnabled")) if "isDepositEnabled" in c else None
+                add_listing(out, seen, make_listing("KUCOIN", sym, ch, c.get("contractAddress"), s2p[sym], c.get("chainName"),
+                                                    fnum_or_none(c.get("withdrawalMinFee")), fnum(c.get("withdrawalMinSize")), wd, dep))
+        return out
+    def load_book(self):
+        book = {}
+        for t in jget(http_get(f"{self.BASE}/api/v1/market/allTickers", limiter=self.lim, timeout=25), "data", "ticker", default=[]) or []:
+            s = t.get("symbol", "")
+            if not s.endswith("-USDT"): continue
+            bid, ask = fnum(t.get("buy")), fnum(t.get("sell"))
+            if 0 < bid < ask: book[s.replace("-", "")] = (bid, ask, fnum(t.get("volValue")))
+        return book
+    def raw_depth(self, pair):
+        j = jget(http_get(f"{self.BASE}/api/v1/market/orderbook/level2_100", params={"symbol": self.nat(pair)}, limiter=self.lim, timeout=12), "data")
+        return make_depth(clean_levels(j.get("bids")), clean_levels(j.get("asks"))) if j else None
+    def load_futures(self):
+        d = jget(http_get("https://api-futures.kucoin.com/api/v1/contracts/active", limiter=self.lim, timeout=25), "data", default=[])
+        return {("BTC" if x.get("baseCurrency") == "XBT" else x.get("baseCurrency")) for x in d or [] if x.get("quoteCurrency") == "USDT" and x.get("isInverse") is False}
+    def trade_url(self, pair): return f"https://www.kucoin.com/trade/{self.nat(pair)}"
+
+# ---- BITGET ----
+class BitgetEx(Exchange):
+    name = "BITGET"; BASE = "https://api.bitget.com"; status_source = "public"
+    def load_pairs(self):
+        r = http_get(f"{self.BASE}/api/v2/spot/public/symbols", limiter=self.lim, timeout=25); d = jget(r, "data")
+        if d is None: raise http_err(r, "Bitget symbols")
+        return {s["symbol"]: s["baseCoin"] for s in d if s.get("quoteCoin") == "USDT" and s.get("status") in (None, "online")}
+    def load_networks(self, pairs):
+        r = http_get(f"{self.BASE}/api/v2/spot/public/coins", limiter=self.lim, timeout=30); d = jget(r, "data")
+        if d is None: raise http_err(r, "Bitget coins")
+        bases = set(pairs.values()); s2p = _sym2pair(pairs); out, seen = [], set()
+        for coin in d:
+            sym = coin.get("coin")
+            if sym not in bases: continue
+            for c in coin.get("chains") or []:
+                ch = find_chain(c.get("chain"))
+                if not ch: continue
+                wd = as_bool(c.get("withdrawable")) if "withdrawable" in c else None
+                dep = as_bool(c.get("rechargeable")) if "rechargeable" in c else None
+                add_listing(out, seen, make_listing("BITGET", sym, ch, c.get("contractAddress"), s2p[sym], c.get("chain"),
+                                                    fnum_or_none(c.get("withdrawFee")), fnum(c.get("minWithdrawAmount")), wd, dep))
+        return out
+    def load_book(self):
+        book = {}
+        for t in jget(http_get(f"{self.BASE}/api/v2/spot/market/tickers", limiter=self.lim, timeout=25), "data", default=[]) or []:
+            s = t.get("symbol", ""); bid, ask = fnum(t.get("bidPr")), fnum(t.get("askPr"))
+            if s.endswith("USDT") and 0 < bid < ask: book[s] = (bid, ask, fnum(t.get("usdtVolume")))
+        return book
+    def raw_depth(self, pair):
+        j = jget(http_get(f"{self.BASE}/api/v2/spot/market/orderbook", params={"symbol": pair, "type": "step0", "limit": 150}, limiter=self.lim, timeout=12), "data")
+        return make_depth(clean_levels(j.get("bids")), clean_levels(j.get("asks"))) if j else None
+    def load_futures(self):
+        d = jget(http_get(f"{self.BASE}/api/v2/mix/market/contracts", params={"productType": "USDT-FUTURES"}, limiter=self.lim, timeout=25), "data", default=[])
+        return {x.get("baseCoin") for x in d or [] if x.get("symbolStatus") in (None, "normal")}
+    def trade_url(self, pair): return f"https://www.bitget.com/spot/{pair}"
+
+# ---- HTX ----
+class HtxEx(Exchange):
+    name = "HTX"; BASE = "https://api.huobi.pro"; status_source = "public"
+    def to_native(self, pair): return pair.lower()
+    def load_pairs(self):
+        r = http_get(f"{self.BASE}/v1/common/symbols", limiter=self.lim, timeout=25); d = jget(r, "data")
+        if d is None: raise http_err(r, "HTX symbols")
+        out = {}
+        for s in d:
+            if s.get("quote-currency") == "usdt" and s.get("state") in (None, "online"):
+                b = s.get("base-currency", "").upper(); pair = f"{b}USDT"; out[pair] = b; self.native[pair] = s.get("symbol")
+        return out
+    def load_networks(self, pairs):
+        r = http_get(f"{self.BASE}/v2/reference/currencies", limiter=self.lim, timeout=30); d = jget(r, "data")
+        if d is None: raise http_err(r, "HTX reference/currencies")
+        bases = set(pairs.values()); s2p = _sym2pair(pairs); out, seen = [], set()
+        for coin in d:
+            sym = (coin.get("currency") or "").upper()
+            if sym not in bases: continue
+            for c in coin.get("chains") or []:
+                ch = find_chain(c.get("displayName"), c.get("baseChainProtocol"), c.get("baseChain"), c.get("chain"))
+                if not ch: continue
+                wd = (c.get("withdrawStatus") == "allowed") if c.get("withdrawStatus") else None
+                dep = (c.get("depositStatus") == "allowed") if c.get("depositStatus") else None
+                add_listing(out, seen, make_listing("HTX", sym, ch, c.get("contractAddress") or "", s2p[sym], c.get("displayName") or c.get("chain"),
+                                                    fnum_or_none(c.get("transactFeeWithdraw")), fnum(c.get("minWithdrawAmt")), wd, dep))
+        return out
+    def load_book(self):
+        book = {}
+        for t in jget(http_get(f"{self.BASE}/market/tickers", limiter=self.lim, timeout=25), "data", default=[]) or []:
+            s = t.get("symbol", "").upper(); bid, ask = fnum(t.get("bid")), fnum(t.get("ask"))
+            if s.endswith("USDT") and 0 < bid < ask: book[s] = (bid, ask, fnum(t.get("vol")))
+        return book
+    def raw_depth(self, pair):
+        j = jget(http_get(f"{self.BASE}/market/depth", params={"symbol": self.nat(pair), "type": "step0"}, limiter=self.lim, timeout=12), "tick")
+        return make_depth(clean_levels(j.get("bids")), clean_levels(j.get("asks"))) if j else None
+    def load_futures(self):
+        d = jget(http_get("https://api.hbdm.com/linear-swap-api/v1/swap_contract_info", params={"business_type": "swap"}, limiter=self.lim, timeout=25), "data", default=[])
+        return {x.get("symbol") for x in d or [] if str(x.get("contract_code", "")).endswith("-USDT") and x.get("contract_status") == 1}
+    def trade_url(self, pair): return f"https://www.htx.com/trade/{base_of(pair).lower()}_usdt"
+
+# ---- BINGX ----
+class BingxEx(Exchange):
+    name = "BINGX"; BASE = "https://open-api.bingx.com"
+    status_source = "signed" if has_key("BINGX") else "none"
+    def to_native(self, pair): return f"{base_of(pair)}-USDT"
+    def _ts(self): return {"timestamp": int(time.time() * 1000)}
+    def load_pairs(self):
+        r = http_get(f"{self.BASE}/openApi/spot/v1/common/symbols", params=self._ts(), limiter=self.lim, timeout=25); d = jget(r, "data", "symbols")
+        if d is None: raise http_err(r, "BingX symbols")
+        out = {}
+        for s in d:
+            sym = s.get("symbol", "")
+            if not sym.endswith("-USDT") or str(s.get("status", 1)) not in ("1", "TRADING"): continue
+            pair = sym.replace("-", ""); out[pair] = sym[:-5]; self.native[pair] = sym
+        return out
+    def load_networks(self, pairs):
+        if not has_key("BINGX"): return None
+        k, sec, _ = KEYS["BINGX"]; qs, sig = signed_query(sec, self._ts())
+        r = http_get(f"{self.BASE}/openApi/wallets/v1/capital/config/getall?{qs}&signature={sig}", headers={"X-BX-APIKEY": k}, limiter=self.lim, timeout=30)
+        d = jget(r, "data")
+        if not isinstance(d, list): raise http_err(r, f"BingX capital/config {jget(r, 'msg', default='')}")
+        bases = set(pairs.values()); s2p = _sym2pair(pairs); out, seen = [], set()
+        for coin in d:
+            sym = coin.get("coin")
+            if sym not in bases: continue
+            for n in coin.get("networkList") or []:
+                ch = find_chain(n.get("network"), n.get("name"))
+                if not ch: continue
+                add_listing(out, seen, make_listing("BINGX", sym, ch, n.get("contractAddress") or n.get("contract"), s2p[sym], n.get("network"),
+                                                    fnum_or_none(n.get("withdrawFee")), fnum(n.get("withdrawMin")), as_bool(n.get("withdrawEnable")), as_bool(n.get("depositEnable"))))
+        return out
+    def load_book(self):
+        book = {}
+        for t in jget(http_get(f"{self.BASE}/openApi/spot/v1/ticker/24hr", params=self._ts(), limiter=self.lim, timeout=25), "data", default=[]) or []:
+            s = t.get("symbol", ""); bid, ask = fnum(t.get("bidPrice")), fnum(t.get("askPrice"))
+            if s.endswith("USDT") and 0 < bid < ask: book[s.replace("-", "")] = (bid, ask, fnum(t.get("quoteVolume")))
+        return book
+    def raw_depth(self, pair):
+        j = jget(http_get(f"{self.BASE}/openApi/spot/v1/market/depth", params=dict(self._ts(), symbol=self.nat(pair), limit=100), limiter=self.lim, timeout=12), "data")
+        return make_depth(clean_levels(j.get("bids")), clean_levels(j.get("asks"))) if j else None
+    def load_futures(self):
+        d = jget(http_get(f"{self.BASE}/openApi/swap/v2/quote/contracts", params=self._ts(), limiter=self.lim, timeout=25), "data", default=[])
+        return {x.get("symbol", "")[:-5] for x in d or [] if x.get("symbol", "").endswith("-USDT") and str(x.get("status", 1)) == "1"}
+    def trade_url(self, pair): return f"https://bingx.com/en/spot/{base_of(pair)}USDT"
+
+# ---- LBANK ----
+class LbankEx(Exchange):
+    name = "LBANK"; BASE = "https://api.lbank.info"; status_source = "public-withdraw"
+    def to_native(self, pair): return f"{base_of(pair).lower()}_usdt"
+    def load_pairs(self):
+        r = http_get(f"{self.BASE}/v2/currencyPairs.do", limiter=self.lim, timeout=25); d = jget(r, "data")
+        if d is None: raise http_err(r, "LBank currencyPairs")
+        out = {}
+        for s in d:
+            if isinstance(s, str) and s.endswith("_usdt"):
+                b = s[:-5].upper(); pair = f"{b}USDT"; out[pair] = b; self.native[pair] = s
+        return out
+    def load_networks(self, pairs):
+        # Public: chi co cau hinh RUT (phi, min, canWithDraw). Trang thai NAP khong cong bo -> None.
+        r = http_get(f"{self.BASE}/v2/withdrawConfigs.do", limiter=self.lim, timeout=30); d = jget(r, "data")
+        if not isinstance(d, list): return None
+        bases = {b.upper(): p for p, b in pairs.items()}; out, seen = [], set()
+        for row in d:
+            sym = (row.get("assetCode") or "").upper()
+            if sym not in bases: continue
+            ch = find_chain(row.get("chain"), row.get("chainName"))
+            if not ch: continue
+            add_listing(out, seen, make_listing("LBANK", sym, ch, row.get("contractAddress") or "", bases[sym], row.get("chain"),
+                                                fnum_or_none(row.get("fee")), fnum(row.get("min")), as_bool(row.get("canWithDraw")), None))
+        return out
+    def load_book(self):
+        book = {}
+        for t in jget(http_get(f"{self.BASE}/v2/supplement/ticker/bookTicker.do", limiter=self.lim, timeout=25), "data", default=[]) or []:
+            s = t.get("symbol", "")
+            bid, ask = fnum(t.get("bidPrice")), fnum(t.get("askPrice"))
+            if s.endswith("_usdt") and 0 < bid < ask: book[s.replace("_", "").upper()] = (bid, ask, None)
+        if book: return book
+        for t in jget(http_get(f"{self.BASE}/v2/ticker/24hr.do", params={"symbol": "all"}, limiter=self.lim, timeout=25), "data", default=[]) or []:
+            s = t.get("symbol", ""); tk = t.get("ticker") or {}; last = fnum(tk.get("latest"))
+            if s.endswith("_usdt") and last > 0: book[s.replace("_", "").upper()] = (last * 0.998, last * 1.002, fnum(tk.get("turnover")))
+        return book
+    def raw_depth(self, pair):
+        j = jget(http_get(f"{self.BASE}/v2/depth.do", params={"symbol": self.nat(pair), "size": 200}, limiter=self.lim, timeout=12), "data")
+        return make_depth(clean_levels(j.get("bids")), clean_levels(j.get("asks"))) if j else None
+    def trade_url(self, pair): return f"https://www.lbank.com/trade/{self.nat(pair)}"
+
+_EX = {"MEXC": MexcEx, "GATE": GateEx, "KUCOIN": KucoinEx, "BITGET": BitgetEx, "BYBIT": BybitEx, "BINANCE": BinanceEx, "OKX": OkxEx, "BINGX": BingxEx, "HTX": HtxEx, "LBANK": LbankEx}
+EXCHANGES = {n: _EX[n]() for n in ENABLED_CEXS}
+
+# ============================ DU LIEU TONG HOP CEX ============================
+class MultiData:
+    def __init__(self):
+        self.lock = threading.Lock(); self.refresh_lock = threading.Lock(); self.ts = 0.0; self.retry_after = 0.0
+        self.tokens = {}; self.tok_ts = {}; self.health = {}; self.by_chain = {}; self.sym_index = {}
+        self.stable = {}; self.cand = {}; self.fut_ts = 0.0; self.first_done = threading.Event()
+    def ensure(self):
+        now = time.time()
+        if self.by_chain and now - self.ts < STATIC_TTL: return
+        if now < self.retry_after: return
+        if not self.refresh_lock.acquire(blocking=False): return
+        events = []
+        try:
+            if now - self.fut_ts > 3600: self._load_futures(); self.fut_ts = now
+            def load(name):
+                ex = EXCHANGES[name]; t0 = time.time()
+                pairs = ex.load_pairs()
+                if not pairs: raise RuntimeError("0 cap USDT")
+                toks = ex.load_networks(pairs)
+                return name, pairs, toks, time.time() - t0
+            with ThreadPoolExecutor(max_workers=len(EXCHANGES)) as pool:
+                futs = {n: pool.submit(load, n) for n in EXCHANGES}
+                for n, f in futs.items():
+                    h = self.health.setdefault(n, {"ok": False, "err": "", "pairs": 0, "listings": 0, "verified": False, "fail_since": None})
+                    try:
+                        name, pairs, toks, dt = f.result(timeout=150)
+                    except Exception as e:
+                        h.update(ok=False, err=str(e)[:200]); h["fail_since"] = h["fail_since"] or time.time()
+                        log.error("Lam moi %s loi: %s", n, e)
+                        if time.time() - h["fail_since"] > 1800: error_alert(f"cex:{n}", f"<b>{n}</b> loi lien tuc >30 phut: {esc(h['err'])}")
+                        continue
+                    verified = toks is not None
+                    if toks is None: toks = []
+                    h.update(ok=True, err="" if verified else "khong co du lieu mang (thieu API key?)", pairs=len(pairs), listings=len(toks), verified=verified, fail_since=None)
+                    events += self._diff_status(n, toks)
+                    with self.lock: self.tokens[n] = toks; self.tok_ts[n] = time.time()
+                    log.info("%s: %d cap, %d token-mang (%.1fs)%s", n, len(pairs), len(toks), dt, "" if verified else " [KHONG CO DU LIEU MANG]")
+            if not any(h["ok"] for h in self.health.values()) and not self.by_chain:
+                self.retry_after = time.time() + 60; return
+            self._build()
+        finally:
+            self.refresh_lock.release(); self.first_done.set()
+        if events: handle_status_events(events)
+    def _load_futures(self):
+        def lf(ex):
+            try: return ex.name, ex.load_futures()
+            except Exception as e: log.debug("%s futures loi %s", ex.name, e); return ex.name, None
+        with ThreadPoolExecutor(max_workers=len(EXCHANGES)) as pool:
+            for name, fut in pool.map(lf, EXCHANGES.values()):
+                if fut: EXCHANGES[name].futures = {x.upper() for x in fut if x}
+    def _diff_status(self, name, toks):
+        """Chong nhay trang thai: chi bao khi trang thai moi giu nguyen STATUS_CONFIRM lan lam moi lien tiep."""
+        ev = []; st = self.stable.setdefault(name, {}); cd = self.cand.setdefault(name, {}); first = not st
+        for t in toks:
+            for field, kind in (("withdraw_enable", "withdraw"), ("deposit_enable", "deposit")):
+                k = (t["chain"], t["key"] or t["symbol"], t["symbol"], field); v = t[field]
+                if v is None: continue
+                if k not in st: st[k] = v; continue
+                if v == st[k]: cd.pop(k, None); continue
+                c = cd.get(k)
+                cnt = c[1] + 1 if c and c[0] == v else 1
+                if cnt >= STATUS_CONFIRM:
+                    st[k] = v; cd.pop(k, None)
+                    if not first: ev.append((name, t, ("open_" if v else "close_") + kind))
+                else: cd[k] = (v, cnt)
+        return ev
+    def _build(self):
+        now = time.time(); bc = {k: {} for k in CHAINS}; pending = []
+        with self.lock: items = list(self.tokens.items())
+        for name, toks in items:
+            if now - self.tok_ts.get(name, 0) > STALE_MAX: log.warning("%s: du lieu mang cu -> bo qua", name); continue
+            for t in toks:
+                if t["chain"] not in bc: continue
+                if not t["contract"]: pending.append(t); continue
+                e = bc[t["chain"]].setdefault(t["key"], {"contract": t["contract"], "key": t["key"], "symbol": t["symbol"], "listings": []})
+                e["listings"].append(t)
+        idx = {}
+        for ch, ents in bc.items():
+            for e in ents.values():
+                for l in e["listings"]: idx.setdefault((ch, norm_sym(l["symbol"])), {})[e["key"]] = e
+        merged = 0
+        if ALLOW_INFERRED_CONTRACT:
+            for t in pending:
+                cands = list(idx.get((t["chain"], norm_sym(t["symbol"])), {}).values())
+                if len(cands) != 1: continue
+                e = cands[0]
+                if any(l["cex"] == t["cex"] for l in e["listings"]): continue
+                e["listings"].append(dict(t, contract=e["contract"], key=e["key"], inferred=True)); merged += 1
+        with self.lock:
+            self.by_chain = {k: list(v.values()) for k, v in bc.items()}; self.sym_index = idx; self.ts = time.time()
+        log.info("Tong hop: %s | ghep theo symbol: %d", ", ".join(f"{k}={len(v)}" for k, v in self.by_chain.items()), merged)
+    def resolve(self, t):
+        if t.get("contract"): return t
+        if not ALLOW_INFERRED_CONTRACT: return None
+        c = list(self.sym_index.get((t["chain"], norm_sym(t["symbol"])), {}).values())
+        if len(c) != 1: return None
+        return dict(t, contract=c[0]["contract"], key=c[0]["key"], inferred=True)
+    def futures_for(self, sym):
+        s = norm_sym(sym)
+        return [n for n, ex in EXCHANGES.items() if s in ex.futures or f"1000{s}" in ex.futures]
+MULTI = MultiData()
+
+# ============================ DEX POOL (DEXSCREENER) ============================
+def fetch_dex_pools(ch, addrs):
+    """Gop TAT CA pool tren MOI DEX cua tung token (DexScreener). Tra ve {key: info}; None neu API loi.
+    - Chi tinh pool >= MIN_POOL_LIQ_EACH, bo pool gia lech >20% so voi trung vi (pool rac / gia ao)
+    - Thanh khoan, volume, so giao dich = TONG cac DEX; gia = trung binh theo thanh khoan
+    - price_min / price_max: DEX re nhat / dat nhat (de loc nhanh); quote that van qua aggregator dinh tuyen moi DEX"""
+    cid = CHAINS[ch]["dex"]; real = [a for a in addrs if valid_contract(ch, a)]
+    if not real: return {}
+    want = {norm_addr(ch, a) for a in real}
+    r = http_get(f"https://api.dexscreener.com/tokens/v1/{cid}/{','.join(urlquote(a, safe='') for a in real)}", limiter=DEX_LIMITER, timeout=15)
+    ok = r is not None and r.status_code == 200; API.report("dexscreener", ok)
+    if not ok: return None
+    try: pairs = r.json()
+    except Exception: return None
+    if not isinstance(pairs, list): return None
+    by_tok = {}; now_ms = time.time() * 1000
+    for p in pairs:
+        if p.get("chainId") != cid: continue
+        base, quote = p.get("baseToken") or {}, p.get("quoteToken") or {}
+        bk, qk = norm_addr(ch, base.get("address")), norm_addr(ch, quote.get("address"))
+        pu, pn = fnum(p.get("priceUsd")), fnum(p.get("priceNative"))
+        if bk in want: key, price, me, other = bk, pu, base, quote
+        elif qk in want and pu > 0 and pn > 0: key, price, me, other = qk, pu / pn, quote, base
+        else: continue
+        liq = fnum((p.get("liquidity") or {}).get("usd"))
+        if price <= 0 or liq < MIN_POOL_LIQ_EACH: continue
+        h1 = (p.get("txns") or {}).get("h1") or {}; created = fnum(p.get("pairCreatedAt")); pc = p.get("priceChange") or {}
+        by_tok.setdefault(key, []).append({"price": price, "liq": liq, "vol24": fnum((p.get("volume") or {}).get("h24")),
+            "txns_h1": int(fnum(h1.get("buys")) + fnum(h1.get("sells"))), "age_h": (now_ms - created) / 3.6e6 if created > 0 else 9999,
+            "dex": (p.get("dexId") or "?").lower(), "url": p.get("url") or "", "pair_name": f"{me.get('symbol')}/{other.get('symbol')}",
+            "dex_symbol": me.get("symbol") or "", "chg_m5": fnum(pc.get("m5")), "chg_h1": fnum(pc.get("h1"))})
+    out = {}
+    for key, pools in by_tok.items():
+        prices = sorted(x["price"] for x in pools); med = prices[len(prices) // 2]
+        good = [x for x in pools if abs(x["price"] - med) / med <= 0.20]
+        if not good: continue
+        liq_total = sum(x["liq"] for x in good); top = max(good, key=lambda x: x["liq"])
+        dexes = {}
+        for x in good:
+            d = dexes.setdefault(x["dex"], {"liq": 0.0, "pv": 0.0, "vol24": 0.0, "pools": 0}); d["liq"] += x["liq"]; d["pv"] += x["price"] * x["liq"]; d["vol24"] += x["vol24"]; d["pools"] += 1
+        dex_list = sorted(({"dex": k, "liq": v["liq"], "price": v["pv"] / v["liq"], "vol24": v["vol24"], "pools": v["pools"]} for k, v in dexes.items()), key=lambda x: -x["liq"])
+        deep = [x for x in good if x["liq"] >= max(MIN_POOL_LIQ_EACH * 2, liq_total * 0.05)] or [top]
+        info = dict(top)
+        info.update(price=sum(x["price"] * x["liq"] for x in good) / liq_total, liq_total=liq_total, liq=top["liq"],
+                    vol24=sum(x["vol24"] for x in good), txns_h1=sum(x["txns_h1"] for x in good), age_h=max(x["age_h"] for x in good),
+                    price_min=min(x["price"] for x in deep), price_max=max(x["price"] for x in deep), dexes=dex_list, n_pools=len(good))
+        if info["liq_total"] < MIN_LIQ_USD or info["vol24"] < MIN_VOL_24H or info["txns_h1"] < MIN_TXNS_H1 or info["age_h"] < MIN_POOL_AGE_H: continue
+        out[key] = info
     return out
 
-COOLDOWN = {}
-CD_LOCK = threading.Lock()
-def should_alert(key, adj_pct):
-    with CD_LOCK:
-        last = COOLDOWN.get(key)
-    if not last:
-        return True
-    t, p = last
-    age = (datetime.now() - t).total_seconds()
-    return age >= COOLDOWN_MIN * 60 or (age >= 300 and adj_pct > p * 1.3)
-def mark_alerted(key, adj_pct):
-    with CD_LOCK:
-        COOLDOWN[key] = (datetime.now(), adj_pct)
-
-PAUSED = set()
-BL = {}
-BL_LOCK = threading.Lock()
-BAD_STREAK = {}
-def is_blacklisted(chain_key, tok):
-    now = time.time()
-    with BL_LOCK:
-        for k in (f"SYM:{tok['symbol'].upper()}", f"TOK:{chain_key}:{tok['dedup_key']}"):
-            u = BL.get(k)
-            if u and u > now:
-                return True
-    return False
-
-class PaperDB:
-    def __init__(self, path):
-        self.lock = threading.Lock()
-        self.conn = sqlite3.connect(path, check_same_thread=False)
-        with self.lock:
-            c = self.conn
-            try:
-                c.execute("PRAGMA journal_mode=WAL")
-            except:
-                pass
-            c.execute("""CREATE TABLE IF NOT EXISTS signals(
-                id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, chain TEXT, symbol TEXT, contract TEXT,
-                direction TEXT, pair TEXT, dex TEXT, order_usd REAL, token_amount REAL, mexc_avg REAL,
-                dex_exec REAL, dex_price REAL, liq REAL, gross_pct REAL, net_pct REAL, net_usd REAL,
-                net_pct_5m REAL, net_pct_10m REAL, raw TEXT)""")
-            for col, typ in (("adj_net_pct", "REAL"), ("risk_buf", "REAL"), ("st_5m", "TEXT"), ("st_10m", "TEXT")):
-                try:
-                    c.execute(f"ALTER TABLE signals ADD COLUMN {col} {typ}")
-                except sqlite3.OperationalError:
-                    pass
-            c.execute("""CREATE TABLE IF NOT EXISTS followups(
-                fid INTEGER PRIMARY KEY AUTOINCREMENT, signal_id INTEGER, minutes INTEGER, due REAL, done INTEGER DEFAULT 0)""")
-            c.execute("CREATE TABLE IF NOT EXISTS blacklist(key TEXT PRIMARY KEY, until REAL, reason TEXT)")
-            c.execute("UPDATE followups SET done=0 WHERE done=2")
-            c.commit()
-    def insert(self, chain, tok, pool, p):
-        with self.lock:
-            cur = self.conn.execute(
-                "INSERT INTO signals(ts,chain,symbol,contract,direction,pair,dex,order_usd,token_amount,mexc_avg,dex_exec,"
-                "dex_price,liq,gross_pct,net_pct,net_usd,adj_net_pct,risk_buf,raw) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (datetime.now().isoformat(), chain, tok["symbol"], tok["contract"], p["direction"], tok["pair"],
-                 pool["dex"], ORDER_SIZE_USD, p["token_amount"], p["mexc_avg"], p["dex_exec"], pool["price"],
-                 pool["liq"], p["gross_pct"], p["net_pct"], p["net_usd"], p["adj_net_pct"], p["risk_buf"],
-                 json.dumps({"profit": p, "pool": pool, "tok": tok}, default=str)))
-            sid = cur.lastrowid
-            now = time.time()
-            for m in FOLLOWUP_MIN:
-                self.conn.execute("INSERT INTO followups(signal_id,minutes,due) VALUES(?,?,?)", (sid, m, now + m * 60))
-            self.conn.commit()
-            return sid
-    def due_followups(self, limit=20):
-        with self.lock:
-            cur = self.conn.execute("""SELECT f.fid,f.signal_id,f.minutes,s.chain,s.direction,s.raw FROM followups f
-                JOIN signals s ON s.id=f.signal_id WHERE f.done=0 AND f.due<=? ORDER BY f.due LIMIT ?""", (time.time(), limit))
-            rows = cur.fetchall()
-            for r in rows:
-                self.conn.execute("UPDATE followups SET done=2 WHERE fid=?", (r[0],))
-            self.conn.commit()
-            return rows
-    def finish_followup(self, fid, sid, minutes, value, status):
-        if minutes not in (5, 10):
-            return
-        with self.lock:
-            self.conn.execute(f"UPDATE signals SET net_pct_{minutes}m=?, st_{minutes}m=? WHERE id=?", (value, status, sid))
-            self.conn.execute("UPDATE followups SET done=1 WHERE fid=?", (fid,))
-            self.conn.commit()
-    def recent(self, n=50):
-        with self.lock:
-            cur = self.conn.execute("SELECT id,ts,chain,symbol,direction,gross_pct,net_pct,adj_net_pct,net_pct_5m,st_5m,net_pct_10m,st_10m FROM signals ORDER BY id DESC LIMIT ?", (n,))
-            cols = [c[0] for c in cur.description]
-            return [dict(zip(cols, r)) for r in cur.fetchall()]
-    def chain_outcomes(self, chain, n=40):
-        with self.lock:
-            cur = self.conn.execute("SELECT net_pct_5m, st_5m FROM signals WHERE chain=? AND st_5m IN ('ok','gone') ORDER BY id DESC LIMIT ?", (chain, n))
-            return cur.fetchall()
-    def summary(self, n=500):
-        with self.lock:
-            cur = self.conn.execute("SELECT chain,direction,net_pct,adj_net_pct,net_pct_5m,st_5m,net_pct_10m,st_10m FROM signals ORDER BY id DESC LIMIT ?", (n,))
-            rows = cur.fetchall()
-        agg = {}
-        for chain, d, net, adj, n5, s5, n10, s10 in rows:
-            a = agg.setdefault((chain, d), {"n": 0, "alert_net": 0.0, "n5": 0, "w5": 0, "sum5": 0.0, "n10": 0, "w10": 0})
-            a["n"] += 1; a["alert_net"] += net or 0
-            if s5 in ("ok", "gone"):
-                a["n5"] += 1
-                if s5 == "ok" and (n5 or 0) > 0:
-                    a["w5"] += 1
-                a["sum5"] += (n5 if s5 == "ok" and n5 is not None else 0.0)
-            if s10 in ("ok", "gone"):
-                a["n10"] += 1
-                if s10 == "ok" and (n10 or 0) > 0:
-                    a["w10"] += 1
-        out = []
-        for (chain, d), a in sorted(agg.items()):
-            out.append({"chain": chain, "direction": d, "signals": a["n"], "avg_alert_net": round(a["alert_net"] / a["n"], 3),
-                        "followed_5m": a["n5"], "winrate_5m": round(a["w5"] / a["n5"], 3) if a["n5"] else None,
-                        "avg_net_5m": round(a["sum5"] / a["n5"], 3) if a["n5"] else None,
-                        "winrate_10m": round(a["w10"] / a["n10"], 3) if a["n10"] else None})
-        return out
-    def load_blacklist(self):
-        with self.lock:
-            return self.conn.execute("SELECT key, until FROM blacklist WHERE until>?", (time.time(),)).fetchall()
-    def save_blacklist(self, key, until, reason):
-        with self.lock:
-            self.conn.execute("INSERT OR REPLACE INTO blacklist(key,until,reason) VALUES(?,?,?)", (key, until, reason))
-            self.conn.commit()
-    def del_blacklist(self, key):
-        with self.lock:
-            self.conn.execute("DELETE FROM blacklist WHERE key=?", (key,))
-            self.conn.commit()
-
-DB = PaperDB(DB_PATH)
-for _k, _u in DB.load_blacklist():
-    BL[_k] = _u
-
-_AD_CACHE = {}
-def adaptive_threshold(chain_key):
-    if not ADAPTIVE:
-        return THRESHOLD_NET
-    c = _AD_CACHE.get(chain_key)
-    if c and time.time() - c[0] < 300:
-        return c[1]
-    rows = DB.chain_outcomes(chain_key, 40)
-    thr = THRESHOLD_NET
-    if len(rows) >= 15:
-        wins = sum(1 for v, s in rows if s == "ok" and (v or 0) > 0)
-        wr = wins / len(rows)
-        if wr < 0.35:
-            thr = THRESHOLD_NET + 0.4
-        elif wr < 0.50:
-            thr = THRESHOLD_NET + 0.2
-        elif wr > 0.70:
-            thr = max(THRESHOLD_NET * 0.8, THRESHOLD_NET - 0.1)
-    _AD_CACHE[chain_key] = (time.time(), thr)
-    return thr
-
-def process_followup(row):
-    fid, sid, minutes, chain, direction, raw = row
-    value, status = None, "error"
+# ============================ DECIMALS ============================
+DEC_CACHE = {}; DEC_LOCK = threading.Lock()
+def get_decimals(ch, token):
+    key = (ch, norm_addr(ch, token))
+    with DEC_LOCK:
+        if key in DEC_CACHE: return DEC_CACHE[key]
+    cfg = CHAINS[ch]; dec = None
     try:
-        tok = json.loads(raw)["tok"]
-        pools = fetch_dex_pools(chain, [tok["contract"]])
-        if pools is None:
-            raise RuntimeError("dex api")
-        pool = pools.get(tok["dedup_key"])
-        depth = mexc_depth(tok["pair"]) if pool else None
-        if not pool or not depth:
-            status = "gone"
+        if cfg["kind"] == "sol":
+            j = rpc_post(SOL_RPC, {"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [token]})
+            dec = (((j or {}).get("result") or {}).get("value") or {}).get("decimals")
+        elif cfg["kind"] == "near":
+            j = rpc_post(cfg["rpc"], {"jsonrpc": "2.0", "id": "1", "method": "query", "params": {"request_type": "call_function", "finality": "final", "account_id": token, "method_name": "ft_metadata", "args_base64": "e30="}})
+            raw = ((j or {}).get("result") or {}).get("result")
+            if raw: dec = json.loads(bytes(raw).decode()).get("decimals")
         else:
-            status = "gone"
-            for p in evaluate(chain, tok, pool, depth):
-                if p["direction"] == direction:
-                    value, status = p["adj_net_pct"], "ok"
-    except Exception as e:
-        log.warning("Follow-up loi: %s", e)
-        status = "error"
-    DB.finish_followup(fid, sid, minutes, value, status)
-    if minutes == 5 and status in ("ok", "gone"):
-        try:
-            tok = json.loads(raw)["tok"]
-            key = (chain, tok["dedup_key"], direction)
-            win = status == "ok" and (value or 0) > 0
-            BAD_STREAK[key] = 0 if win else BAD_STREAK.get(key, 0) + 1
-            if BAD_STREAK[key] >= BAD_STREAK_BLACKLIST:
-                until = time.time() + BLACKLIST_HOURS * 3600
-                bk = f"TOK:{chain}:{tok['dedup_key']}"
-                with BL_LOCK:
-                    BL[bk] = until
-                DB.save_blacklist(bk, until, "bad streak")
-                BAD_STREAK[key] = 0
-                send_telegram(f"🚫 Tu dong blacklist {esc(tok['symbol'])} [{chain}] {BLACKLIST_HOURS:.0f}h")
-        except:
-            log.exception("blacklist loi")
+            if cfg.get("rpc"):
+                j = rpc_post(cfg["rpc"], {"jsonrpc": "2.0", "id": 1, "method": "eth_call", "params": [{"to": token, "data": "0x313ce567"}, "latest"]})
+                res = (j or {}).get("result")
+                if res and res not in ("0x", "0x0") and len(res) >= 3: dec = int(res, 16)
+            if dec is None and cfg.get("blockscout"):
+                dec = fnum_or_none(jget(http_get(f"{cfg['blockscout'].rstrip('/')}/api/v2/tokens/{token}", timeout=10), "decimals"))
+    except Exception as e: log.debug("decimals loi %s %s: %s", ch, token[:10], e)
+    API.report(f"rpc-{ch}", dec is not None)
+    if dec is not None and 0 <= int(dec) <= 36:
+        with DEC_LOCK: DEC_CACHE[key] = int(dec)
+        return int(dec)
+    return None
 
-def followup_loop():
-    ex = ThreadPoolExecutor(max_workers=3, thread_name_prefix="FU")
-    while True:
-        time.sleep(10)
+# ============================ QUOTE DEX ============================
+NATIVE_PX = {}; NATIVE_LOCK = threading.Lock()
+def kyber_route(slug, tin, tout, amount_raw):
+    r = http_get(f"{KYBER_URL}/{slug}/api/v1/routes", params={"tokenIn": tin, "tokenOut": tout, "amountIn": str(int(amount_raw)), "gasInclude": "true"},
+                 headers={"X-Client-Id": KYBER_CLIENT_ID}, limiter=KYBER_LIMITER, timeout=10, retries=1)
+    if r is None: API.report("kyberswap", False); return None, "error"
+    if r.status_code == 200:
+        rs = jget(r, "data", "routeSummary")
+        API.report("kyberswap", True)
+        if not rs or fnum(rs.get("amountOut")) <= 0: return None, "noroute"
+        return rs, "ok"
+    if r.status_code in (400, 404, 422): API.report("kyberswap", True); return None, "noroute"
+    API.report("kyberswap", False); return None, "error"
+def _impact(usd_in, usd_out):
+    return max(0.0, (usd_in - usd_out) / usd_in * 100) if usd_in and usd_out and usd_in > 0 else None
+def native_price(ch, token):
+    """Gia native (ETH...) theo USD qua KyberSwap (cho mang khong co stablecoin cau hinh)."""
+    with NATIVE_LOCK:
+        c = NATIVE_PX.get(ch)
+        if c and time.time() - c[0] < 120: return c[1]
+    rs, kind = kyber_route(CHAINS[ch]["kyber"], NATIVE, token, 10**16)
+    px = fnum(rs.get("amountInUsd")) / 0.01 if rs else 0
+    if px > 0:
+        with NATIVE_LOCK: NATIVE_PX[ch] = (time.time(), px)
+        return px
+    return None
+def evm_quote(ch, tin_is_usd, token, dec, amount):
+    """amount: USD (khi mua) hoac so token (khi ban). Tra ve dict chuan hoa."""
+    cfg = CHAINS[ch]; st = cfg.get("stable")
+    if st:
+        sa, sd = st
+        tin, tout, raw = (sa, token, amount * 10**sd) if tin_is_usd else (token, sa, amount * 10**dec)
+        cands = []; kinds = []
+        rs, kind = kyber_route(cfg["kyber"], tin, tout, raw); kinds.append(kind)
+        if rs:
+            if tin_is_usd: out_amt = fnum(rs["amountOut"]) / 10**dec; usd_in, usd_out = amount, fnum(rs.get("amountOutUsd"))
+            else: out_amt = fnum(rs["amountOut"]) / 10**sd; usd_in, usd_out = fnum(rs.get("amountInUsd")), out_amt
+            cands.append({"out": out_amt, "impact": _impact(usd_in, usd_out), "gas_usd": fnum(rs.get("gasUsd")) + fnum(rs.get("l1FeeUsd")), "src": "KyberSwap"})
+        if cfg.get("chain_id") in PARASWAP_CHAINS and (MULTI_AGG or kind == "error"):
+            q, kind2 = paraswap_quote(cfg["chain_id"], tin, tout, raw, sd if tin_is_usd else dec, dec if tin_is_usd else sd); kinds.append(kind2)
+            if q: cands.append({"out": q["out"] / 10**(dec if tin_is_usd else sd), "impact": q["impact"], "gas_usd": q["gas_usd"], "src": "ParaSwap"})
+        if cands:
+            best = max(cands, key=lambda x: x["out"])
+            if len(cands) > 1: best = dict(best, src=f"{best['src']} (tốt hơn {min(cands, key=lambda x: x['out'])['src']})" if cands[0]["out"] != cands[1]["out"] else best["src"])
+            return best, "ok"
+        return None, ("error" if all(k == "error" for k in kinds) else "noroute")
+    px = native_price(ch, token)
+    if not px: return None, "error"
+    if tin_is_usd:
+        rs, kind = kyber_route(cfg["kyber"], NATIVE, token, amount / px * 1e18)
+        if not rs: return None, kind
+        return {"out": fnum(rs["amountOut"]) / 10**dec, "impact": _impact(fnum(rs.get("amountInUsd")), fnum(rs.get("amountOutUsd"))), "gas_usd": fnum(rs.get("gasUsd")) + fnum(rs.get("l1FeeUsd")), "src": "KyberSwap"}, "ok"
+    rs, kind = kyber_route(cfg["kyber"], token, NATIVE, amount * 10**dec)
+    if not rs: return None, kind
+    usd_out = fnum(rs["amountOut"]) / 1e18 * px
+    return {"out": usd_out, "impact": _impact(fnum(rs.get("amountInUsd")), usd_out), "gas_usd": fnum(rs.get("gasUsd")) + fnum(rs.get("l1FeeUsd")), "src": "KyberSwap"}, "ok"
+def paraswap_quote(chain_id, src, dest, raw, sdec, ddec):
+    r = http_get(PARASWAP_URL, params={"srcToken": src, "destToken": dest, "amount": str(int(raw)), "srcDecimals": sdec, "destDecimals": ddec, "side": "SELL", "network": chain_id, "version": "6.2"}, limiter=PARA_LIMITER, timeout=10, retries=1)
+    if r is None: API.report("paraswap", False); return None, "error"
+    if r.status_code == 200:
+        API.report("paraswap", True); pr = jget(r, "priceRoute", default={}); out = fnum(pr.get("destAmount"))
+        if out <= 0: return None, "noroute"
+        return {"out": out, "impact": _impact(fnum(pr.get("srcUSD")), fnum(pr.get("destUSD"))), "gas_usd": fnum(pr.get("gasCostUSD"))}, "ok"
+    if r.status_code in (400, 404): API.report("paraswap", True); return None, "noroute"
+    API.report("paraswap", False); return None, "error"
+def jup_quote(imint, omint, raw):
+    params = {"inputMint": imint, "outputMint": omint, "amount": str(int(raw)), "slippageBps": 100, "restrictIntermediateTokens": "true"}
+    eps = ([(JUPITER_PRO_URL, {"x-api-key": JUPITER_API_KEY})] if JUPITER_API_KEY else []) + [(JUPITER_LITE_URL, None)]
+    for url, h in eps:
+        r = http_get(url, params=params, headers=h, limiter=JUP_LIMITER, timeout=10, retries=1)
+        if r is None: API.report("jupiter", False); continue
+        if r.status_code == 200:
+            API.report("jupiter", True); out = fnum(jget(r, "outAmount"))
+            if out <= 0: return None, "noroute"
+            return {"out": out, "impact": abs(fnum(jget(r, "priceImpactPct"))) * 100}, "ok"
+        if r.status_code in (400, 404): API.report("jupiter", True); return None, "noroute"
+        API.report("jupiter", False)
+    return None, "error"
+def ref_quote(tin, tout, raw):
+    r = http_get(REF_ROUTER_URL, params={"amountIn": str(int(raw)), "tokenIn": tin, "tokenOut": tout, "pathDeep": 3, "slippage": 0.005}, limiter=REF_LIMITER, timeout=12, retries=1)
+    if r is None or r.status_code != 200: API.report("ref-finance", False); return None, "error"
+    API.report("ref-finance", True)
+    out = fnum(jget(r, "result_data", "amount_out"))
+    if jget(r, "result_code") not in (0, "0", None) or out <= 0: return None, "noroute"
+    return {"out": out, "impact": None}, "ok"
+def dex_buy(ch, token, dec, usd):
+    """Nap usd vao DEX -> nhan bao nhieu token."""
+    k = chain_kind(ch)
+    if k == "evm": q, kind = evm_quote(ch, True, token, dec, usd)
+    elif k == "sol":
+        j, kind = jup_quote(SOL_USDC, token, usd * 1e6)
+        q = {"out": j["out"] / 10**dec, "impact": j["impact"], "gas_usd": None, "src": "Jupiter"} if j else None
+    else:
+        j, kind = ref_quote(NEAR_USDC, token, usd * 1e6)
+        q = {"out": j["out"] / 10**dec, "impact": None, "gas_usd": None, "src": "Ref Finance"} if j else None
+    if not q or q["out"] <= 0: return None, kind if not q else "noroute"
+    q["price"] = usd / q["out"]; return q, "ok"
+def dex_sell(ch, token, dec, tokens):
+    """Ban tokens tren DEX -> nhan bao nhieu USD."""
+    if tokens <= 0: return None, "noroute"
+    k = chain_kind(ch)
+    if k == "evm": q, kind = evm_quote(ch, False, token, dec, tokens)
+    elif k == "sol":
+        j, kind = jup_quote(token, SOL_USDC, tokens * 10**dec)
+        q = {"out": j["out"] / 1e6, "impact": j["impact"], "gas_usd": None, "src": "Jupiter"} if j else None
+    else:
+        j, kind = ref_quote(token, NEAR_USDC, tokens * 10**dec)
+        q = {"out": j["out"] / 1e6, "impact": None, "gas_usd": None, "src": "Ref Finance"} if j else None
+    if not q or q["out"] <= 0: return None, kind if not q else "noroute"
+    q["price"] = q["out"] / tokens; return q, "ok"
+
+# ============================ TAX & BAO MAT ============================
+SEC_CACHE = {}; SEC_LOCK = threading.Lock()
+GP_HARD = {"is_honeypot": "honeypot", "cannot_sell_all": "khong ban het duoc", "owner_change_balance": "owner sua so du", "cannot_buy": "khong mua duoc"}
+GP_SOFT = {"transfer_pausable": "co the tam dung chuyen", "is_blacklisted": "co blacklist", "slippage_modifiable": "owner sua duoc tax",
+           "hidden_owner": "owner an", "trading_cooldown": "cooldown giao dich", "can_take_back_ownership": "lay lai owner", "is_mintable": "mint them duoc",
+           "personal_slippage_modifiable": "tax rieng tung vi", "external_call": "goi contract ngoai"}
+def _pct(v):
+    v = fnum_or_none(v)
+    if v is None: return None
+    if v > 1: v = v / 100.0
+    return max(0.0, min(v, 1.0))
+def _honeypot(chain_id, token):
+    r = http_get(HONEYPOT_URL, params={"address": token, "chainID": chain_id}, limiter=SEC_LIMITER, timeout=12, retries=1)
+    ok = r is not None and r.status_code == 200; API.report("honeypot.is", ok)
+    if not ok: return None
+    j = jget(r, default={}) or {}
+    if not j.get("simulationSuccess"):
+        return {"bad": "honeypot.is khong mo phong duoc mua/ban"} if (j.get("honeypotResult") or {}).get("isHoneypot") else None
+    sim = j.get("simulationResult") or {}
+    bad = "honeypot" if (j.get("honeypotResult") or {}).get("isHoneypot") else None
+    return {"buy": _pct(sim.get("buyTax")) or 0.0, "sell": _pct(sim.get("sellTax")) or 0.0, "transfer": _pct(sim.get("transferTax")) or 0.0, "bad": bad}
+def _goplus(chain_id, token):
+    r = http_get(f"{GOPLUS_URL}/{chain_id}", params={"contract_addresses": token}, limiter=SEC_LIMITER, timeout=12, retries=1)
+    ok = r is not None and r.status_code == 200; API.report("goplus", ok)
+    if not ok: return None
+    res = jget(r, "result", default={}) or {}
+    d = res.get(token.lower()) or res.get(token) or {}
+    if not d: return None
+    bad = next((n for k, n in GP_HARD.items() if str(d.get(k)) == "1"), None)
+    soft = [n for k, n in GP_SOFT.items() if str(d.get(k)) == "1"]
+    bt, stx, tt = _pct(d.get("buy_tax")), _pct(d.get("sell_tax")), _pct(d.get("transfer_tax"))
+    if str(d.get("is_open_source")) == "0": soft.append("contract khong verify")
+    return {"buy": bt, "sell": stx, "transfer": tt, "bad": bad, "soft": soft, "known": bt is not None and stx is not None}
+def _sol_sec(token):
+    j = rpc_post(SOL_RPC, {"jsonrpc": "2.0", "id": 1, "method": "getAccountInfo", "params": [token, {"encoding": "jsonParsed"}]})
+    data = ((((j or {}).get("result") or {}).get("value")) or {}).get("data")
+    if not isinstance(data, dict): return None
+    info = (data.get("parsed") or {}).get("info") or {}
+    if not info: return None
+    soft, bad, fee = [], None, 0.0
+    if info.get("freezeAuthority"): soft.append("con freeze authority")
+    if info.get("mintAuthority"): soft.append("con mint authority")
+    for ext in info.get("extensions") or []:
+        e = ext.get("extension"); st = ext.get("state") or {}
+        if e == "transferFeeConfig":
+            nf = st.get("newerTransferFee") or {}; of = st.get("olderTransferFee") or {}
+            fee = max(fee, fnum(nf.get("transferFeeBasisPoints", of.get("transferFeeBasisPoints", 0))) / 10000.0)
+        elif e in ("permanentDelegate", "nonTransferable"): bad = e
+        elif e == "transferHook": soft.append("transfer hook")
+        elif e == "pausableConfig": soft.append("co the tam dung")
+    return {"buy": fee, "sell": fee, "transfer": fee, "bad": bad, "soft": soft, "known": True, "src": "Solana RPC"}
+def get_security(ch, token):
+    key = (ch, norm_addr(ch, token))
+    with SEC_LOCK:
+        c = SEC_CACHE.get(key)
+        if c and time.time() - c[0] < (3600 if c[1]["known"] else 600): return c[1]
+    cfg = CHAINS[ch]
+    sec = {"known": False, "buy": 0.0, "sell": 0.0, "transfer": 0.0, "bad": None, "soft": [], "src": "khong co nguon"}
+    try:
+        if cfg["kind"] == "sol":
+            s = _sol_sec(token); API.report("sol-rpc", s is not None)
+            if s: sec = s
+        elif cfg["kind"] == "near":
+            sec = {"known": True, "buy": 0.0, "sell": 0.0, "transfer": 0.0, "bad": None, "soft": [], "src": "NEP-141 (khong co co che tax)"}
+        else:
+            cid = cfg["chain_id"]; srcs = []; buy = sell = tr = None; bad = None; soft = []
+            if cid in HONEYPOT_CHAINS:
+                h = _honeypot(cid, token)
+                if h:
+                    srcs.append("honeypot.is"); bad = bad or h.get("bad")
+                    if "buy" in h: buy, sell, tr = h["buy"], h["sell"], h["transfer"]
+            if cid in GOPLUS_CHAINS:
+                g = _goplus(cid, token)
+                if g:
+                    srcs.append("GoPlus"); bad = bad or g["bad"]; soft += g["soft"]
+                    if g["known"]:
+                        buy = max(buy or 0.0, g["buy"]); sell = max(sell or 0.0, g["sell"])
+                        if g["transfer"] is not None: tr = max(tr or 0.0, g["transfer"])
+            has_source = cid in HONEYPOT_CHAINS or cid in GOPLUS_CHAINS
+            sec = {"known": buy is not None and sell is not None, "buy": buy or 0.0, "sell": sell or 0.0, "transfer": tr or 0.0,
+                   "bad": bad, "soft": soft, "src": "+".join(srcs) or "khong co nguon", "nosource": not has_source}
+    except Exception as e: log.warning("Security loi %s %s: %s", ch, token[:10], e)
+    with SEC_LOCK:
+        SEC_CACHE[key] = (time.time(), sec)
+        if len(SEC_CACHE) > 5000: SEC_CACHE.pop(next(iter(SEC_CACHE)), None)
+    return sec
+def effective_tax(sec):
+    """Tax dung de tinh lai. Neu chua xac minh: gia dinh UNKNOWN_TAX_ASSUME (che do assume)."""
+    if sec["known"]: return sec["buy"], sec["sell"], sec["transfer"], False
+    if sec.get("nosource"): return NO_SOURCE_TAX, NO_SOURCE_TAX, NO_SOURCE_TAX, False   # mang chua co nguon -> mac dinh 0%
+    return max(sec["buy"], UNKNOWN_TAX_ASSUME), max(sec["sell"], UNKNOWN_TAX_ASSUME), sec["transfer"], True
+
+# ============================ TINH LOI NHUAN ============================
+class Diag:
+    """Ghi ly do loai (dung cho /check)."""
+    def __init__(self, on=False): self.on = on; self.lines = []
+    def add(self, s):
+        if self.on: self.lines.append(s)
+
+def cex_to_dex(ch, tok, pool, depth, sec, dec, usd, mult, fee_cex):
+    """Mua usd tren CEX -> rut ve vi -> ban tren DEX."""
+    w = walk_usd(depth["asks"], usd)
+    if not w: return None, "so lenh ban CEX khong du"
+    avg, tokens = w
+    slip = (avg / depth["asks"][0][0] - 1) * 100
+    if slip > MAX_CEX_SLIP_PCT: return None, f"truot gia CEX {slip:.1f}%"
+    t_after_fee = tokens * (1 - fee_cex)
+    wfee = tok["withdraw_fee"] * mult
+    if t_after_fee < tok["withdraw_min"] * mult: return None, "duoi muc rut toi thieu"
+    _, sell_tax, tr_tax, assumed = effective_tax(sec)
+    t_received = (t_after_fee - wfee) * (1 - tr_tax)
+    if t_received <= 0: return None, "phi rut lon hon so token"
+    q, kind = dex_sell(ch, tok["contract"], dec, t_received)
+    if not q: return None, f"quote ban DEX: {kind}"
+    gas = q["gas_usd"] if q.get("gas_usd") else CHAINS[ch]["gas_usd"]
+    usd_out = q["out"] * (1 - sell_tax) * (1 - EXTRA_SLIPPAGE)
+    net = usd_out - gas - usd
+    return {"direction": "CEX_TO_DEX", "usd_size": usd, "cex_avg": avg, "cex_slip": slip, "tokens_cex": tokens, "tokens_after_fee": t_after_fee,
+            "withdraw_fee_tok": wfee, "withdraw_fee_usd": wfee * avg, "tokens_received": t_received, "dex_quote_usd": q["out"], "dex_price": q["price"],
+            "impact": q["impact"], "usd_out": usd_out, "gas": gas, "net_usd": net, "net_pct": net / usd * 100,
+            "gross_pct": (q["price"] / avg - 1) * 100, "quote_src": q["src"], "sell_tax": sell_tax, "transfer_tax": tr_tax, "buy_tax": 0.0, "tax_assumed": assumed}, "ok"
+
+def dex_to_cex(ch, tok, pool, depth, sec, dec, usd, mult, fee_cex):
+    """Mua usd tren DEX -> nap len CEX -> ban vao so lenh mua CEX."""
+    buy_tax, _, tr_tax, assumed = effective_tax(sec)
+    q, kind = dex_buy(ch, tok["contract"], dec, usd)
+    if not q: return None, f"quote mua DEX: {kind}"
+    t_after_buy = q["out"] * (1 - buy_tax) * (1 - EXTRA_SLIPPAGE)
+    t_deposit = t_after_buy * (1 - tr_tax)
+    proceeds = walk_tokens(depth["bids"], t_deposit)
+    if not proceeds: return None, "so lenh mua CEX khong hap thu het"
+    avg = proceeds / t_deposit; slip = (1 - avg / depth["bids"][0][0]) * 100
+    if slip > MAX_CEX_SLIP_PCT: return None, f"truot gia CEX {slip:.1f}%"
+    gas_buy = q["gas_usd"] if q.get("gas_usd") else CHAINS[ch]["gas_usd"]
+    gas = gas_buy + CHAINS[ch]["gas_usd"]          # gas swap + gas chuyen len san
+    revenue = proceeds * (1 - fee_cex); cost = usd + gas; net = revenue - cost
+    return {"direction": "DEX_TO_CEX", "usd_size": usd, "dex_price": q["price"], "impact": q["impact"], "tokens_dex": q["out"], "tokens_after_buy": t_after_buy,
+            "tokens_deposit": t_deposit, "cex_avg": avg, "cex_slip": slip, "proceeds": proceeds, "revenue": revenue, "gas": gas,
+            "net_usd": net, "net_pct": net / cost * 100, "gross_pct": (avg / q["price"] - 1) * 100, "quote_src": q["src"],
+            "buy_tax": buy_tax, "transfer_tax": tr_tax, "sell_tax": 0.0, "tax_assumed": assumed}, "ok"
+
+def size_cap(pool, depth, direction):
+    cap_dex = pool["liq_total"] * SIZE_LIQ_MAX_FRAC
+    side = depth["asks"] if direction == "CEX_TO_DEX" else depth["bids"]
+    cap_cex = depth_usd(side, MAX_CEX_SLIP_PCT) * 0.9
+    return min(ORDER_SIZE_MAX, cap_dex, cap_cex), cap_dex, cap_cex
+
+def best_size(fn, direction, ch, tok, pool, depth, sec, dec, mult, fee_cex, diag, fixed=None):
+    """Thu cac muc size tu nho den lon (chi phi co dinh nhu phi rut/gas lam size qua nho bi thiet, size lon bi truot gia).
+    SIZE_MODE=pct: chon size co % lai cao nhat (mac dinh) | usd: chon size co $ lai cao nhat. Ca hai deu phai dat nguong."""
+    if fixed:
+        r, why = fn(ch, tok, pool, depth, sec, dec, fixed, mult, fee_cex)
+        return r, [(fixed, r["net_pct"] if r else None)], why
+    cap, cap_dex, cap_cex = size_cap(pool, depth, direction)
+    if cap < ORDER_SIZE_MIN:
+        diag.add(f"{direction}: size toi da ${cap:.0f} < ${ORDER_SIZE_MIN:.0f} (DEX cho ${cap_dex:.0f}, so lenh CEX cho ${cap_cex:.0f})")
+        return None, [], "thin"
+    steps = sorted({s for s in SIZE_STEPS if ORDER_SIZE_MIN <= s <= cap} | ({math.floor(cap / 10) * 10} if cap < ORDER_SIZE_MAX else set()))
+    tried, res, last_why, falling = [], {}, "", 0
+    for s in steps:
+        if len(tried) >= MAX_SIZE_QUOTES: break
+        r, why = fn(ch, tok, pool, depth, sec, dec, s, mult, fee_cex)
+        tried.append((s, r["net_pct"] if r else None)); last_why = why; res[s] = r
+        if not r: break                                   # so lenh/quote khong du o size nay -> size lon hon cung khong du
+        if len(tried) == 1 and r["net_pct"] < 0: break    # lo ngay o size nho nhat -> bo
+        prev = [x for x in res.values() if x and x is not r]
+        if prev and r["net_pct"] < max(x["net_pct"] for x in prev):
+            falling += 1
+            if SIZE_MODE == "pct" or r["net_pct"] < MIN_NET_PCT or falling >= 2: break
+    ok = [r for r in res.values() if r and r["net_pct"] >= MIN_NET_PCT and r["net_usd"] >= MIN_NET_USD]
+    if not ok:
+        top = max((r for r in res.values() if r), key=lambda x: x["net_pct"], default=None)
+        return None, tried, (f"lai tot nhat {top['net_pct']:.2f}% (${top['net_usd']:.2f}) < nguong" if top else last_why)
+    best = max(ok, key=(lambda x: (x["net_pct"], x["net_usd"])) if SIZE_MODE == "pct" else (lambda x: x["net_usd"]))
+    return best, tried, "ok"
+
+def evaluate(ch, tok, pool, depth, diag=None, fixed=None, only_dir=None):
+    """Tra ve danh sach ket qua dat nguong (toi da 1 moi chieu)."""
+    diag = diag or Diag(); st = STATS[ch]; ex = EXCHANGES[tok["cex"]]
+    mult = unit_mult(tok["symbol"], pool["dex_symbol"]); d = scale_depth(depth, mult)
+    bid, ask = d["bids"][0][0], d["asks"][0][0]; mid = (bid + ask) / 2
+    spread = (ask - bid) / ask * 100
+    if spread > MAX_CEX_SPREAD: diag.add(f"spread CEX {spread:.2f}% > {MAX_CEX_SPREAD}%"); return []
+    dev = abs(mid - pool["price"]) / pool["price"]
+    lim_dev = MAX_PRICE_DEV_INFERRED if tok.get("inferred") else MAX_PRICE_DEV
+    if dev > lim_dev:
+        st.inc("contract_skip"); diag.add(f"gia CEX lech DEX {dev*100:.0f}% > {lim_dev*100:.0f}% -> nghi khac token / san doi ty le"); return []
+    sec = get_security(ch, tok["contract"])
+    if sec["bad"]: st.inc("tax_skip"); diag.add(f"bao mat: {sec['bad']}"); return []
+    if max(sec["buy"], sec["sell"], sec["transfer"]) > TAX_MAX: st.inc("tax_skip"); diag.add(f"tax qua cao (mua {sec['buy']*100:.1f}% / ban {sec['sell']*100:.1f}% / chuyen {sec['transfer']*100:.1f}%)"); return []
+    if not sec["known"] and not sec.get("nosource") and UNKNOWN_TAX_MODE == "skip": st.inc("tax_skip"); diag.add("khong xac minh duoc tax (UNKNOWN_TAX_MODE=skip)"); return []
+    dec = get_decimals(ch, tok["contract"])
+    if dec is None: st.inc("quote_fail"); diag.add("khong doc duoc decimals (kiem tra RPC)"); return []
+    fee_cex = ex.taker_fee(tok["cex_pair"]); out = []
+    plans = []
+    if status_ok(tok.get("withdraw_enable")) and tok.get("withdraw_fee") is not None: plans.append(("CEX_TO_DEX", cex_to_dex))
+    else: diag.add(f"CEX→DEX: rut {status_icon(tok.get('withdraw_enable'))}, phi rut {'?' if tok.get('withdraw_fee') is None else tok['withdraw_fee']}")
+    if status_ok(tok.get("deposit_enable")): plans.append(("DEX_TO_CEX", dex_to_cex))
+    else: diag.add(f"DEX→CEX: nap {status_icon(tok.get('deposit_enable'))}")
+    for direction, fn in plans:
+        if only_dir and direction != only_dir: continue
+        st.inc("evaluated")
+        r, tried, why = best_size(fn, direction, ch, tok, pool, d, sec, dec, mult, fee_cex, diag, fixed)
+        diag.add(f"{direction}: " + (", ".join(f"${s:.0f}→{p:+.2f}%" if p is not None else f"${s:.0f}→x" for s, p in tried) or "-") + f" | {why}")
+        if why == "thin": st.inc("thin")
+        if not r:
+            if "quote" in why: st.inc("quote_fail")
+            continue
+        imp = r["impact"]
+        if imp is not None and imp > MAX_IMPACT_PCT: diag.add(f"{direction}: impact DEX {imp:.2f}% > {MAX_IMPACT_PCT}%"); continue
+        if abs(r["dex_price"] - pool["price"]) / pool["price"] > 0.25: st.inc("suspect"); diag.add(f"{direction}: gia quote lech gia pool >25% -> bo"); continue
+        r.update(cex=tok["cex"], mult=mult, cex_fee=fee_cex, cex_bid=bid, cex_ask=ask, spread=spread, sec=sec, tried=tried, checked_at=time.time(),
+                 withdraw_enable=tok.get("withdraw_enable"), deposit_enable=tok.get("deposit_enable"), inferred=tok.get("inferred", False))
+        out.append(r)
+    return out
+
+# ============================ TELEGRAM ============================
+_TAG_RE = re.compile(r"<[^>]+>")
+def send_telegram(text, chat_id=None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id or CHAT_ID, "text": text[:4000], "parse_mode": "HTML", "disable_web_page_preview": True}
+    for _ in range(4):
         try:
-            rows = DB.due_followups()
-            if rows:
-                list(ex.map(process_followup, rows))
-        except:
-            log.exception("followup_loop loi")
+            TG_LIMITER.wait()
+            r = session().post(url, data=payload, timeout=15)
+            if r.status_code == 200: return True
+            if r.status_code == 429:
+                try: ra = float(r.json().get("parameters", {}).get("retry_after", 5))
+                except Exception: ra = 5
+                time.sleep(min(ra, 30)); continue
+            if r.status_code == 400 and payload.get("parse_mode"):
+                log.warning("Telegram 400 (HTML loi): %s -> gui dang text", r.text[:150])
+                payload = {"chat_id": payload["chat_id"], "text": html.unescape(_TAG_RE.sub("", text))[:4000], "disable_web_page_preview": True}; continue
+            log.warning("Telegram that bai %s: %s", r.status_code, r.text[:200]); return False
+        except Exception as e: log.warning("Telegram loi: %s", e); time.sleep(3)
+    return False
+def send_long(text):
+    chunk = ""
+    for line in text.split("\n"):
+        if len(chunk) + len(line) > 3800: send_telegram(chunk); chunk = ""
+        chunk += line + "\n"
+    if chunk.strip(): send_telegram(chunk)
 
 def fmt_price(v):
-    try:
-        v = float(v or 0)
-        if v == 0:
-            return "0"
-        if abs(v) >= 1:
-            return f"{v:.6f}"
-        if abs(v) >= 0.01:
-            return f"{v:.8f}"
-        return f"{v:.12f}"
-    except:
-        return str(v)
-def fmt_token_amount(v):
-    try:
-        v = float(v)
-        return f"{v:,.0f}" if v >= 1000 else f"{v:.6f}"
-    except:
-        return str(v)
+    v = fnum(v)
+    if v == 0: return "0"
+    if abs(v) >= 100: return f"{v:,.2f}"
+    if abs(v) >= 1: return f"{v:.4f}"
+    if abs(v) >= 0.0001: return f"{v:.6f}"
+    s = f"{v:.12f}".rstrip("0"); return s
+def fmt_tok(v):
+    v = fnum(v)
+    if v >= 1e9: return f"{v/1e9:,.2f}B"
+    if v >= 1e6: return f"{v/1e6:,.2f}M"
+    return f"{v:,.0f}" if v >= 1000 else f"{v:,.4f}"
+def fmt_usd(v): return f"${fnum(v):,.0f}" if abs(fnum(v)) >= 10000 else f"${fnum(v):,.2f}"
+def pct(v): return f"{fnum(v)*100:.1f}%"
 
-def send_telegram(text):
-    try:
-        r = session().post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                           data={"chat_id": CHAT_ID, "text": text[:4000], "parse_mode": "HTML",
-                                 "disable_web_page_preview": True}, timeout=15)
-        if r.status_code != 200:
-            log.warning("Telegram that bai %s: %s", r.status_code, r.text[:200])
-            return False
-        return True
-    except Exception as e:
-        log.warning("Telegram loi: %s", e)
-        return False
+def swap_urls(ch, token):
+    cfg = CHAINS[ch]
+    if cfg["kind"] == "sol": return f"https://jup.ag/swap/USDC-{token}", f"https://jup.ag/swap/{token}-USDC"
+    if cfg["kind"] == "near": return f"https://app.ref.finance/#{NEAR_USDC}|{token}", f"https://app.ref.finance/#{token}|{NEAR_USDC}"
+    base = (cfg.get("stable") or (NATIVE,))[0]
+    return (f"https://kyberswap.com/swap/{cfg['kyber']}/{base}-to-{token}", f"https://kyberswap.com/swap/{cfg['kyber']}/{token}-to-{base}")
 
-def get_dex_swap_urls(chain_key, contract):
-    """Tra ve (buy_url, sell_url) swap truc tiep, khong phai dexscreener"""
-    c = contract
-    if chain_key == "SOL":
-        # Jupiter - buy: SOL -> token, sell: token -> SOL
-        buy = f"https://jup.ag/swap/SOL-{c}"
-        sell = f"https://jup.ag/swap/{c}-SOL"
-    elif chain_key == "BNB":
-        buy = f"https://pancakeswap.finance/swap?outputCurrency={c}&chainId=56"
-        sell = f"https://pancakeswap.finance/swap?inputCurrency={c}&outputCurrency=0x55d398326f99059fF775485246999027B3197955&chainId=56"
-    elif chain_key == "BASE":
-        buy = f"https://app.uniswap.org/#/swap?chain=base&outputCurrency={c}"
-        sell = f"https://app.uniswap.org/#/swap?chain=base&inputCurrency={c}"
-    elif chain_key == "ETH":
-        buy = f"https://app.uniswap.org/#/swap?outputCurrency={c}&chain=mainnet"
-        sell = f"https://app.uniswap.org/#/swap?inputCurrency={c}&chain=mainnet"
-    elif chain_key == "POLYGON":
-        buy = f"https://app.uniswap.org/#/swap?chain=polygon&outputCurrency={c}"
-        sell = f"https://app.uniswap.org/#/swap?chain=polygon&inputCurrency={c}"
-    elif chain_key == "ARBITRUM":
-        buy = f"https://app.uniswap.org/#/swap?chain=arbitrum&outputCurrency={c}"
-        sell = f"https://app.uniswap.org/#/swap?chain=arbitrum&inputCurrency={c}"
+FIRST_SEEN = {}; FS_LOCK = threading.Lock()
+def spread_age(key):
+    with FS_LOCK:
+        now = time.time(); v = FIRST_SEEN.get(key)
+        if not v or now - v[1] > 900: FIRST_SEEN[key] = [now, now]; return 0.0
+        v[1] = now; return (now - v[0]) / 60
+
+def build_alert(ch, tok, pool, p, tag=""):
+    cfg = CHAINS[ch]; ex = EXCHANGES[tok["cex"]]; sym = tok["symbol"]; cex = tok["cex"]; sec = p["sec"]
+    cex_url = ex.trade_url(tok["cex_pair"]); buy_url, sell_url = swap_urls(ch, tok["contract"])
+    usd = p["usd_size"]; net_line = f"💰 <b>Lãi ròng {p['net_pct']:+.2f}% ({fmt_usd(p['net_usd'])})</b> · vốn {fmt_usd(usd)}"
+    imp = f"{p['impact']:.2f}%" if p.get("impact") is not None else "n/a"
+    if p["direction"] == "CEX_TO_DEX":
+        title = f"{cex} → DEX"
+        steps = (f"1️⃣ Mua trên <a href=\"{esc_url(cex_url)}\">{cex}</a>: {fmt_usd(usd)} → <b>{fmt_tok(p['tokens_cex'])} {esc(sym)}</b> · giá TB {fmt_price(p['cex_avg'])} (trượt {p['cex_slip']:.2f}%, phí {p['cex_fee']*100:.2f}%)\n"
+                 f"2️⃣ Rút về <b>{cfg['name']}</b> ({esc(tok['raw_network'])}): phí rút {fmt_tok(p['withdraw_fee_tok'])} (~{fmt_usd(p['withdraw_fee_usd'])})"
+                 + (f", tax chuyển {pct(p['transfer_tax'])}" if p["transfer_tax"] else "") + f" → nhận <b>{fmt_tok(p['tokens_received'])}</b>\n"
+                 f"3️⃣ <a href=\"{esc_url(sell_url)}\">Bán trên DEX</a> ({p['quote_src']}): ≈ {fmt_usd(p['dex_quote_usd'])} · giá {fmt_price(p['dex_price'])}, impact {imp}"
+                 + (f"\n    − tax bán {pct(p['sell_tax'])}" if p["sell_tax"] else "") + f" − dự phòng trượt {EXTRA_SLIPPAGE*100:.1f}% − gas {fmt_usd(p['gas'])} → <b>{fmt_usd(p['usd_out'] - p['gas'])}</b>")
     else:
-        # fallback: dexscreener
-        buy = f"https://dexscreener.com/{CHAINS[chain_key]['dex_chain']}/{c}"
-        sell = buy
-    return buy, sell
-
-def send_alert(chain_key, tok, pool, p):
-    cfg = CHAINS[chain_key]
-    bid, ask = p["mexc_best"]
-    thr = adaptive_threshold(chain_key)
-    profit_emoji = "🟢" if p["adj_net_pct"] >= 2 else "🟡" if p["adj_net_pct"] >= 1 else "🔵"
-    
-    # Links - SWAP TRUC TIEP
-    mexc_trade_url = f"https://www.mexc.com/exchange/{tok['pair']}"
-    dex_buy_url, dex_sell_url = get_dex_swap_urls(chain_key, tok['contract'])
-    dex_info_url = pool['url']
-    explorer_url = cfg['explorer'] + tok['contract']
-
-    # Action
-    if p["direction"] == "MEXC_TO_DEX":
-        icon = "📤"
-        action = f"<a href='{esc(mexc_trade_url)}'>BUY MEXC</a> → WITHDRAW {chain_key} → <a href='{esc(dex_sell_url)}'>SELL DEX</a>"
-    else:
-        icon = "📥"
-        action = f"<a href='{esc(dex_buy_url)}'>BUY DEX</a> → DEPOSIT MEXC → SELL {esc(tok['pair'])}"
-
-    if p["buy_tax"] or p["sell_tax"]:
-        tax_line = f"Tax: Buy {p['buy_tax']*100:.1f}% / Sell {p['sell_tax']*100:.1f}%"
-    else:
-        tax_line = "Tax: 0%"
-    
-    en_line = f"Deposit: {'✅' if p.get('deposit_enable') else '❌'} | Withdraw: {'✅' if p.get('withdraw_enable') else '❌'}"
-    
+        title = f"DEX → {cex}"
+        steps = (f"1️⃣ <a href=\"{esc_url(buy_url)}\">Mua trên DEX</a> ({p['quote_src']}): {fmt_usd(usd)} → <b>{fmt_tok(p['tokens_dex'])} {esc(sym)}</b> · giá {fmt_price(p['dex_price'])}, impact {imp}"
+                 + (f"\n    − tax mua {pct(p['buy_tax'])}" if p["buy_tax"] else "") + f" − dự phòng trượt {EXTRA_SLIPPAGE*100:.1f}% → {fmt_tok(p['tokens_after_buy'])}\n"
+                 f"2️⃣ Nạp lên <a href=\"{esc_url(cex_url)}\">{cex}</a> qua <b>{cfg['name']}</b> ({esc(tok['raw_network'])})"
+                 + (f", tax chuyển {pct(p['transfer_tax'])}" if p["transfer_tax"] else "") + f" → <b>{fmt_tok(p['tokens_deposit'])}</b> · gas tổng ~{fmt_usd(p['gas'])}\n"
+                 f"3️⃣ Bán trên {cex}: sổ lệnh hấp thụ hết, giá TB {fmt_price(p['cex_avg'])} (trượt {p['cex_slip']:.2f}%, phí {p['cex_fee']*100:.2f}%) → <b>{fmt_usd(p['revenue'])}</b>")
+    tax_src = sec.get("src", "")
+    if sec["known"]: tax_txt = f"mua {pct(sec['buy'])} / bán {pct(sec['sell'])} / chuyển {pct(sec['transfer'])} ({esc(tax_src)})"
+    elif sec.get("nosource"): tax_txt = f"mặc định {pct(NO_SOURCE_TAX)} (mạng {cfg['name']} chưa có nguồn kiểm tra tax)"
+    else: tax_txt = f"tra cứu thất bại → đã giả định mua {pct(UNKNOWN_TAX_ASSUME)} + bán {pct(UNKNOWN_TAX_ASSUME)}"
+    checks = [
+        ("✅ Contract khớp (" + cex + " công bố = pool DEX)") if not tok.get("inferred") else ("⚠ Contract SUY RA theo symbol (" + cex + " không công bố) - tự kiểm tra lại"),
+        f"{status_icon(p['deposit_enable'])} Nạp {cex}  {status_icon(p['withdraw_enable'])} Rút {cex}",
+        ("✅" if sec["known"] else "ℹ️" if sec.get("nosource") else "⚠") + " Tax: " + tax_txt,
+        "✅ Không phát hiện honeypot" if not sec.get("bad") else f"❌ {esc(sec['bad'])}",
+    ]
     warn = []
-    if not p.get("sec_known") and cfg.get("evm"):
-        warn.append("no security data")
-    if p.get("sec_soft"):
-        warn.append(",".join(p["sec_soft"]))
-    warn_line = f"⚠️ {'; '.join(warn)}\n" if warn else ""
-    
-    # V8.8 extras
-    usd_size = p.get("usd_size", ORDER_SIZE_USD)
-    fee_type = p.get("fee_type", "taker")
-    mexc_fee = p.get("mexc_fee", MEXC_TAKER_FEE)
-    ai_score = p.get("ai_score", 0)
-    is_hot = p.get("is_hot", False)
-    transfer_real = p.get("transfer_min_real", cfg['transfer_min'])
-    
-    ai_emoji = "🔥" if ai_score >= 80 else "⭐" if ai_score >= 70 else "✨"
-    inv_suggestion = get_inventory_suggestion(tok["symbol"], usd_size) if is_hot else None
-    if inv_suggestion:
-        hot_line = f"🔥 HOT - Hold ${inv_suggestion['dex_hold_usd']:.0f} on DEX + ${inv_suggestion['cex_hold_usd']:.0f} on {tok.get('cex','CEX')} for instant arb"
-    else:
-        hot_line = "🔥 HOT - High volatility! Recommend hold inventory on both sides" if is_hot else ""
-    
-    msg = (
-        f"{profit_emoji} <b>{esc(tok['symbol'])} [{chain_key}] {p['direction']}</b> | {esc(p.get('real_source','?'))} | {cfg['emoji']} | {ai_emoji} AI {ai_score}/100\n"
-        f"{'─'*24}\n"
-        f"💰 <b>PROFIT {p['adj_net_pct']:.2f}% (${p['net_usd']:.2f})</b> after buffer | NET {p['net_pct']:.2f}%\n"
-        f"📈 Gross {p['gross_pct']:.2f}% → After tax {p['gross_after_tax']:.2f}% | Impact {p['impact_dex']:.2f}%\n"
-        f"🛡️ Buffer {p['risk_buf']:.2f}% | Threshold {thr:.2f}% | Size ${usd_size:.0f} ({fee_type})\n"
-        f"{'─'*24}\n"
-        f"{icon} <b>{action}</b>\n"
-        f"{'─'*24}\n"
-        f"💸 {tax_line} | 🏦 {en_line}\n"
-        f"💵 Capital ${usd_size:.0f} (dynamic {ORDER_SIZE_MIN:.0f}-{ORDER_SIZE_MAX:.0f}) | Amount {fmt_token_amount(p['token_amount'])}\n"
-        f"⛽ Gas ${p['gas']:.2f} | Withdraw Fee ${p['withdraw_fee_usd']:.2f} | MEXC Fee {mexc_fee*100:.2f}% ({fee_type})\n"
-        f"⏱️ Transfer ~{transfer_real:.1f} min (real) | Volatility decay included\n"
-        f"{'─'*24}\n"
-        f"🏦 <b>MEXC {esc(tok['pair'])}</b>\n"
-        f"   Bid {fmt_price(bid)} / Ask {fmt_price(ask)} → Avg ${fmt_price(p['mexc_avg'])}\n"
-        f"🦄 <b>{esc(pool['dex'])} {esc(pool['pair_name'])}</b>\n"
-        f"   DS ${fmt_price(pool['price'])} → Exec ${fmt_price(p['dex_exec'])}\n"
-        f"   💧 ${pool['liq']:,.0f} | Vol ${pool['vol24']:,.0f} | Tx1h {pool['txns_h1']} | Age {pool.get('age_h',0):.0f}h\n"
-        f"   Change 5m {pool.get('chg_m5',0):+.1f}% | 1h {pool.get('chg_h1',0):+.1f}%\n"
-        f"{'─'*24}\n"
-        f"{warn_line}"
-        f"{hot_line + chr(10) if hot_line else ''}"
-        f"📜 Contract: <code>{esc(tok['contract'])}</code>\n"
-        f"🔗 <a href='{esc(mexc_trade_url)}'>MEXC Trade</a> | "
-        f"<a href='{esc(dex_buy_url)}'>DEX Buy</a> | "
-        f"<a href='{esc(dex_sell_url)}'>DEX Sell</a> | "
-        f"<a href='{esc(dex_info_url)}'>Info</a> | "
-        f"<a href='{esc(explorer_url)}'>Explorer</a>\n"
-        f"⏰ {datetime.now().strftime('%H:%M %d/%m')} | AI Score {ai_score}/100 | {'HOT 🔥' if is_hot else 'Normal'}"
-    )
-    return send_telegram(msg)
+    if sec.get("soft"): warn.append("Contract: " + ", ".join(sec["soft"]))
+    if p["gross_pct"] > WARN_GROSS: warn.append(f"chênh lệch {p['gross_pct']:.1f}% lớn bất thường - thường do nạp/rút thực tế bị treo, kiểm tra trên app sàn trước")
+    age = p.get("age_min", 0)
+    if age >= 30: warn.append(f"kèo đã tồn tại {age:.0f} phút - có thể sàn đang treo nạp/rút thực tế")
+    if pool["age_h"] < 48: warn.append(f"pool mới {pool['age_h']:.0f}h")
+    if abs(pool["chg_m5"]) >= 5: warn.append(f"biến động mạnh 5m {pool['chg_m5']:+.1f}%")
+    if p["mult"] != 1: warn.append(f"{cex} niêm yết theo đơn vị x{p['mult']:.0f} - đã quy đổi")
+    fut = MULTI.futures_for(sym)
+    hedge = (f"🛡 Hedge được: có Futures USDT trên {', '.join(fut)}" + (" → short futures ngay khi mua DEX để khoá lời trong lúc chờ nạp" if p["direction"] == "DEX_TO_CEX" else "")) if fut else "🛡 Không có futures để hedge"
+    tried = " · ".join(f"${s:.0f}:{x:+.1f}%" for s, x in sorted(p.get("tried", [])) if x is not None)
+    tm = cfg["transfer_min"] + CEX_EXTRA_MIN.get(cex, 5)
+    msg = (f"{cfg['emoji']} <b>{esc(sym)} [{cfg['name']}] {title}</b>{(' | ' + tag) if tag else ''}\n{net_line}\n"
+           f"📊 Chênh lệch giá {p['gross_pct']:+.2f}% · size tối ưu {fmt_usd(usd)} ({'% lãi cao nhất' if SIZE_MODE == 'pct' else '$ lãi cao nhất'})" + (f" (đã thử {tried})" if tried else "") + "\n"
+           f"━━━━━━━━━━━━━━\n{steps}\n━━━━━━━━━━━━━━\n🔎 " + "\n🔎 ".join(checks) + "\n"
+           f"🏦 {cex} {esc(tok['cex_pair'])}: bid {fmt_price(p['cex_bid'])} / ask {fmt_price(p['cex_ask'])} (spread {p['spread']:.2f}%)\n"
+           f"🦄 DEX ({len(pool.get('dexes', []))} sàn, {pool.get('n_pools', 1)} pool): giá TB {fmt_price(pool['price'])} · tổng liq {fmt_usd(pool['liq_total'])} · vol24h {fmt_usd(pool['vol24'])} · tx1h {pool['txns_h1']} · biến động 5m {pool['chg_m5']:+.1f}% / 1h {pool['chg_h1']:+.1f}%\n"
+           + "".join(f"    • {esc(x['dex'])}: {fmt_price(x['price'])} · liq {fmt_usd(x['liq'])} · vol {fmt_usd(x['vol24'])}\n" for x in pool.get("dexes", [])[:5]) +
+           f"    → Quote thật qua aggregator ({esc(p['quote_src'])}), tự định tuyến qua tất cả DEX để lấy giá tốt nhất\n"
+           f"{hedge}\n" + ("".join(f"⚠ {esc(w)}\n" for w in warn)) +
+           f"📜 <code>{esc(tok['contract'])}</code>\n"
+           f"🔗 <a href=\"{esc_url(cex_url)}\">{cex}</a> | <a href=\"{esc_url(buy_url)}\">DEX mua</a> | <a href=\"{esc_url(sell_url)}\">DEX bán</a> | <a href=\"{esc_url(pool['url'])}\">Chart</a> | <a href=\"{esc_url(cfg['explorer'] + tok['contract'])}\">Explorer</a>\n"
+           f"⏱ Chuyển token ~{tm:.0f} phút · đã xác nhận lại sau {CONFIRM_DELAY:.0f}s · {datetime.now(VN_TZ).strftime('%H:%M:%S %d/%m')}\n"
+           f"<i>Chỉ là cảnh báo, giá có thể đổi trong lúc chuyển. Tự kiểm tra trước khi vào lệnh.</i>")
+    return msg
 
-def summary_text(limit=12):
-    rows = DB.summary()
-    if not rows:
-        return "Chua co du lieu."
-    lines = ["<b>Thong ke (500 signal gan nhat)</b>"]
-    for r in rows[:limit]:
-        wr = f"{r['winrate_5m']*100:.0f}%" if r["winrate_5m"] is not None else "n/a"
-        av = f"{r['avg_net_5m']:+.2f}%" if r["avg_net_5m"] is not None else "n/a"
-        d = "M→D" if r["direction"] == "MEXC_TO_DEX" else "D→M"
-        lines.append(f"{r['chain']} {d}: n={r['signals']} | win5m={wr} (n={r['followed_5m']}) | avg5m={av}")
+# ============================ DATABASE ============================
+class DB_:
+    def __init__(self, path):
+        self.lock = threading.Lock(); self.c = sqlite3.connect(path, check_same_thread=False)
+        with self.lock:
+            try: self.c.execute("PRAGMA journal_mode=WAL")
+            except Exception: pass
+            cols = [r[1] for r in self.c.execute("PRAGMA table_info(signals)").fetchall()]
+            if cols and "usd" not in cols:   # DB cu tu ban truoc -> doi ten, tao bang moi
+                self.c.execute(f"ALTER TABLE signals RENAME TO signals_old_{int(time.time())}")
+                self.c.execute("DROP TABLE IF EXISTS followups")
+            self.c.execute("""CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, chain TEXT, cex TEXT, symbol TEXT, contract TEXT,
+                direction TEXT, usd REAL, gross_pct REAL, net_pct REAL, net_usd REAL, pnl_a REAL, st_a TEXT, pnl_b REAL, st_b TEXT, raw TEXT)""")
+            self.c.execute("CREATE TABLE IF NOT EXISTS followups(fid INTEGER PRIMARY KEY AUTOINCREMENT, sid INTEGER, slot TEXT, due REAL, done INTEGER DEFAULT 0)")
+            fcols = [r[1] for r in self.c.execute("PRAGMA table_info(followups)").fetchall()]
+            if "slot" not in fcols: self.c.execute("DROP TABLE followups"); self.c.execute("CREATE TABLE followups(fid INTEGER PRIMARY KEY AUTOINCREMENT, sid INTEGER, slot TEXT, due REAL, done INTEGER DEFAULT 0)")
+            self.c.execute("CREATE TABLE IF NOT EXISTS blacklist(key TEXT PRIMARY KEY, until REAL, reason TEXT)")
+            self.c.execute("CREATE TABLE IF NOT EXISTS status_events(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, cex TEXT, chain TEXT, symbol TEXT, kind TEXT)")
+            self.c.execute("UPDATE followups SET done=0 WHERE done=2"); self.c.commit()
+    def q(self, sql, args=(), commit=False, one=False):
+        with self.lock:
+            cur = self.c.execute(sql, args)
+            if commit: self.c.commit(); return cur.lastrowid
+            return cur.fetchone() if one else cur.fetchall()
+    def insert(self, ch, tok, pool, p):
+        raw = json.dumps({"tok": tok, "pool": pool, "p": {k: v for k, v in p.items() if k != "sec"}, "sec": p["sec"]}, default=str)
+        sid = self.q("INSERT INTO signals(ts,chain,cex,symbol,contract,direction,usd,gross_pct,net_pct,net_usd,raw) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                     (time.time(), ch, tok["cex"], tok["symbol"], tok["contract"], p["direction"], p["usd_size"], p["gross_pct"], p["net_pct"], p["net_usd"], raw), commit=True)
+        now = time.time()
+        for slot, m in zip(("a", "b"), FOLLOWUP_MIN): self.q("INSERT INTO followups(sid,slot,due) VALUES(?,?,?)", (sid, slot, now + m * 60), commit=True)
+        return sid
+    def due(self):
+        rows = self.q("SELECT f.fid,f.sid,f.slot,s.chain,s.direction,s.raw FROM followups f JOIN signals s ON s.id=f.sid WHERE f.done=0 AND f.due<=? ORDER BY f.due LIMIT 20", (time.time(),))
+        for r in rows: self.q("UPDATE followups SET done=2 WHERE fid=?", (r[0],), commit=True)
+        return rows
+    def finish(self, fid, sid, slot, val, st):
+        self.q(f"UPDATE signals SET pnl_{slot}=?, st_{slot}=? WHERE id=?", (val, st, sid), commit=True)
+        self.q("UPDATE followups SET done=1 WHERE fid=?", (fid,), commit=True)
+DB = DB_(DB_PATH)
+BL = {k: u for k, u in DB.q("SELECT key, until FROM blacklist WHERE until>?", (time.time(),))}; BL_LOCK = threading.Lock(); BAD_STREAK = {}
+def is_blacklisted(ch, tok):
+    now = time.time()
+    with BL_LOCK:
+        return any((BL.get(k) or 0) > now for k in (f"SYM:{norm_sym(tok['symbol'])}", f"TOK:{ch}:{tok['key']}"))
+
+# ============================ QUET ============================
+COOLDOWN = {}; CD_LOCK = threading.Lock(); PAUSED = set()
+def should_alert(key, net_pct):
+    with CD_LOCK: last = COOLDOWN.get(key)
+    if not last: return True
+    t, p = last; age = time.time() - t
+    return age >= COOLDOWN_MIN * 60 or (age >= 300 and net_pct > p * 1.5)
+def prefilter(tok, pool, book):
+    """Loc nhanh bang gia ticker (khong ton quote)."""
+    bt = book.get(tok["cex_pair"])
+    if not bt: return False
+    mult = unit_mult(tok["symbol"], pool["dex_symbol"]); bid, ask = bt[0] / mult, bt[1] / mult
+    hi, lo = pool.get("price_max", pool["price"]), pool.get("price_min", pool["price"]); fee = TAKER_FEE.get(tok["cex"], 0.002)
+    imp = min(0.05, 300 / max(pool["liq_total"], 1)) + 0.003   # uoc tinh truot gia + phi pool cho size nho
+    g1 = ((hi * (1 - imp)) / (ask * (1 + fee)) - 1) * 100 if status_ok(tok.get("withdraw_enable")) and tok.get("withdraw_fee") is not None else -99   # ban o DEX dat nhat
+    g2 = ((bid * (1 - fee)) / (lo * (1 + imp)) - 1) * 100 if status_ok(tok.get("deposit_enable")) else -99                                            # mua o DEX re nhat
+    return max(g1, g2) >= MIN_NET_PCT * 0.6
+def check_candidate(ch, tok, pool, diag=None):
+    try:
+        depth = EXCHANGES[tok["cex"]].depth(tok["cex_pair"])
+        if not depth:
+            if diag: diag.add("khong lay duoc so lenh CEX")
+            return []
+        return [(tok, pool, p) for p in evaluate(ch, tok, pool, depth, diag)]
+    except Exception:
+        STATS[ch].inc("errors"); log.exception("Loi xu ly %s %s", ch, tok["symbol"]); return []
+def confirm(ch, tok, pool, p):
+    time.sleep(CONFIRM_DELAY)
+    depth = EXCHANGES[tok["cex"]].depth(tok["cex_pair"])
+    if not depth: return None
+    for p2 in evaluate(ch, tok, pool, depth, fixed=p["usd_size"], only_dir=p["direction"]):
+        if p2["net_pct"] >= MIN_NET_PCT and p2["net_usd"] >= MIN_NET_USD: return p2
+    return None
+def process(ch, results, tag=""):
+    for tok, pool, p in sorted(results, key=lambda r: -r[2]["net_usd"]):
+        key = (ch, tok["cex"], tok["key"], p["direction"])
+        p["age_min"] = spread_age(key)
+        if not should_alert(key, p["net_pct"]): continue
+        p2 = confirm(ch, tok, pool, p)
+        if not p2: STATS[ch].inc("unconfirmed"); continue
+        p2["age_min"] = p["age_min"]
+        if send_telegram(build_alert(ch, tok, pool, p2, tag)):
+            with CD_LOCK: COOLDOWN[key] = (time.time(), p2["net_pct"])
+            STATS[ch].inc("signals"); DB.insert(ch, tok, pool, p2)
+def scan_chain_once(ch, stop):
+    st = STATS[ch]; MULTI.ensure(); entries = MULTI.by_chain.get(ch, [])
+    if not entries: return False
+    need = {l["cex"] for e in entries for l in e["listings"]}
+    books = {n: EXCHANGES[n].get_book() for n in need}
+    for i in range(0, len(entries), DEX_BATCH):
+        if stop.is_set() or ch in PAUSED: return True
+        st.beat(); chunk = entries[i:i + DEX_BATCH]
+        pools = fetch_dex_pools(ch, [e["contract"] for e in chunk])
+        if pools is None: st.inc("errors"); stop.wait(3); continue
+        cands = []
+        for e in chunk:
+            pool = pools.get(e["key"])
+            if not pool: continue
+            st.inc("pools")
+            for tok in e["listings"]:
+                st.inc("scanned")
+                if not symbol_ok(tok["symbol"], pool["dex_symbol"]): st.inc("contract_skip"); continue
+                if is_blacklisted(ch, tok): continue
+                if prefilter(tok, pool, books.get(tok["cex"]) or {}): cands.append((tok, pool))
+        if cands:
+            st.inc("candidates", len(cands))
+            with ThreadPoolExecutor(max_workers=3) as pool_ex:
+                res = [x for lst in pool_ex.map(lambda c: check_candidate(ch, c[0], c[1]), cands) for x in lst]
+            if res: process(ch, res)
+    st.last_scan = time.time()
+    return True
+def run_chain(ch, stop):
+    log.info("[%s] bat dau", ch); empty = 0
+    while not stop.is_set():
+        try:
+            STATS[ch].beat()
+            if not scan_chain_once(ch, stop): empty += 1; stop.wait(60 if empty < 10 else 300); continue
+            empty = 0; stop.wait(SCAN_PAUSE_SEC)
+        except Exception: STATS[ch].inc("errors"); log.exception("[%s] loi vong quet", ch); stop.wait(20)
+class Worker:
+    def __init__(self, ch): self.ch = ch; self.stop = None; self.thread = None
+    def start(self):
+        self.stop = threading.Event(); STATS[self.ch].beat()
+        self.thread = threading.Thread(target=run_chain, args=(self.ch, self.stop), daemon=True, name=f"Scan-{self.ch}"); self.thread.start()
+    def restart(self):
+        if self.stop: self.stop.set()
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=5)
+            if self.thread.is_alive(): log.warning("[%s] vong cu chua thoat, cho lan sau", self.ch); return
+        self.start()
+
+# ============================ SU KIEN NAP / RUT ============================
+KIND_TXT = {"open_withdraw": "🔓 MỞ RÚT", "open_deposit": "🔓 MỞ NẠP", "close_withdraw": "🔒 ĐÓNG RÚT", "close_deposit": "🔒 ĐÓNG NẠP"}
+PRIO = ThreadPoolExecutor(max_workers=2, thread_name_prefix="PRIO")
+def handle_status_events(events):
+    for cex, tok, kind in events: DB.q("INSERT INTO status_events(ts,cex,chain,symbol,kind) VALUES(?,?,?,?,?)", (time.time(), cex, tok["chain"], tok["symbol"], kind), commit=True)
+    if not STATUS_NOTIFY: return
+    by_cex = {}
+    for cex, tok, kind in events: by_cex.setdefault(cex, []).append((tok, kind))
+    for cex, lst in by_cex.items():
+        lst.sort(key=lambda x: (not x[1].startswith("open"), x[0]["symbol"]))
+        lines = [f"🔔 <b>{cex}: thay đổi nạp/rút ({len(lst)})</b>"]
+        for tok, kind in lst[:STATUS_MAX_LINES]:
+            lines.append(f"{KIND_TXT[kind]} <b>{esc(tok['symbol'])}</b> · {CHAINS[tok['chain']]['name']} ({esc(tok['raw_network'])})")
+        if len(lst) > STATUS_MAX_LINES: lines.append(f"... và {len(lst) - STATUS_MAX_LINES} thay đổi khác")
+        lines.append("<i>Token vừa MỞ sẽ được kiểm tra chênh lệch ngay.</i>")
+        send_telegram("\n".join(lines))
+    for cex, tok, kind in events:
+        if kind.startswith("open"): PRIO.submit(check_opened, cex, tok, kind)
+def check_opened(cex, tok, kind):
+    try:
+        t = MULTI.resolve(tok); ch = tok["chain"]
+        if not t or is_blacklisted(ch, t): return
+        pools = fetch_dex_pools(ch, [t["contract"]]); pool = (pools or {}).get(t["key"])
+        if not pool or not symbol_ok(t["symbol"], pool["dex_symbol"]): return
+        res = check_candidate(ch, t, pool)
+        if res: process(ch, res, tag=f"{KIND_TXT[kind]} trên {cex}")
+    except Exception: log.exception("check_opened loi")
+
+# ============================ THEO DOI KET QUA (PAPER) ============================
+def realized(ch, direction, tok, p):
+    """Lenh mo tai luc bao, dong sau X phut voi gia THAT luc do."""
+    dec = get_decimals(ch, tok["contract"])
+    if dec is None: return None, "error"
+    if direction == "CEX_TO_DEX":
+        q, kind = dex_sell(ch, tok["contract"], dec, p["tokens_received"])
+        if kind == "error": return None, "error"
+        if not q: return None, "gone"
+        out = q["out"] * (1 - p["sell_tax"]) * (1 - EXTRA_SLIPPAGE) - p["gas"]
+        return (out - p["usd_size"]) / p["usd_size"] * 100, "ok"
+    depth = EXCHANGES[tok["cex"]].depth(tok["cex_pair"]) if tok["cex"] in EXCHANGES else None
+    if not depth: return None, "error"
+    d = scale_depth(depth, p.get("mult", 1.0)); proceeds = walk_tokens(d["bids"], p["tokens_deposit"])
+    if not proceeds: return None, "gone"
+    cost = p["usd_size"] + p["gas"]
+    return (proceeds * (1 - p["cex_fee"]) - cost) / cost * 100, "ok"
+def followup_loop():
+    while True:
+        time.sleep(15)
+        try:
+            for fid, sid, slot, ch, direction, raw in DB.due():
+                val, st = None, "error"
+                try:
+                    j = json.loads(raw); tok, p = j["tok"], j["p"]
+                    val, st = realized(ch, direction, tok, p)
+                except Exception as e: log.warning("follow-up loi %s", e)
+                DB.finish(fid, sid, slot, val, st)
+                if slot == "a" and st in ("ok", "gone"):
+                    key = (ch, tok["cex"], tok["key"], direction); win = st == "ok" and (val or 0) > 0
+                    BAD_STREAK[key] = 0 if win else BAD_STREAK.get(key, 0) + 1
+                    if BAD_STREAK[key] >= BAD_STREAK_BLACKLIST:
+                        until = time.time() + BLACKLIST_HOURS * 3600; bk = f"TOK:{ch}:{tok['key']}"
+                        with BL_LOCK: BL[bk] = until
+                        DB.q("INSERT OR REPLACE INTO blacklist VALUES(?,?,?)", (bk, until, "lo lien tiep"), commit=True); BAD_STREAK[key] = 0
+                        log.info("Tu dong blacklist %s %s", ch, tok["symbol"])
+        except Exception: log.exception("followup loi")
+
+# ============================ BAO CAO NGAY ============================
+def cex_health_lines():
+    out = []
+    for n in EXCHANGES:
+        h = MULTI.health.get(n)
+        if not h: out.append(f"⏳ {n}: chưa tải"); continue
+        if not h["ok"]: out.append(f"❌ {n}: {esc(h['err'])}")
+        elif not h["verified"]: out.append(f"⚠ {n}: {h['pairs']} cặp, KHÔNG có dữ liệu mạng/nạp-rút → {esc(h['err'])}")
+        else: out.append(f"✅ {n}: {h['pairs']} cặp, {h['listings']} token-mạng")
+    return out
+def daily_report():
+    now = datetime.now(VN_TZ); since = time.time() - 86400
+    rows = DB.q("SELECT symbol,chain,cex,direction,net_pct,net_usd,pnl_a,st_a FROM signals WHERE ts>? ORDER BY net_usd DESC", (since,))
+    ev = DB.q("SELECT kind, COUNT(*) FROM status_events WHERE ts>? GROUP BY kind", (since,))
+    done = [r for r in rows if r[7] in ("ok", "gone")]; wins = [r for r in done if r[7] == "ok" and (r[6] or 0) > 0]
+    L = [f"📊 <b>DAILY REPORT {now.strftime('%d/%m/%Y')} · {VERSION}</b>",
+         f"Kèo đã báo 24h: <b>{len(rows)}</b> · tổng lãi dự kiến {fmt_usd(sum(r[5] or 0 for r in rows))}",
+         (f"Kiểm chứng sau {FOLLOWUP_MIN[0]} phút (paper): thắng {len(wins)}/{len(done)} ({len(wins)/len(done)*100:.0f}%)" if done else "Kiểm chứng paper: chưa có dữ liệu")]
+    if rows:
+        L.append("\n<b>Top kèo:</b>")
+        for s, ch, cx, d, npct, nusd, pa, sa in rows[:8]:
+            res = f"→ {pa:+.1f}%" if sa == "ok" and pa is not None else (f"→ {sa}" if sa else "")
+            L.append(f"• {esc(s)} [{ch}] {'DEX→' + cx if d == 'DEX_TO_CEX' else cx + '→DEX'}: {npct:+.2f}% ({fmt_usd(nusd)}) {res}")
+    L.append("\n<b>Quét theo mạng (24h):</b>")
+    for k, st in STATS.items():
+        s = st.snapshot(daily=True)
+        L.append(f"{CHAINS[k]['emoji']} {k}: pool {s.get('pools',0)} · ứng viên {s.get('candidates',0)} · kèo {s.get('signals',0)} · không xác nhận {s.get('unconfirmed',0)} · loại tax {s.get('tax_skip',0)} · lệch contract/giá {s.get('contract_skip',0)} · mỏng {s.get('thin',0)}")
+    if ev: L.append("\nNạp/rút đổi trạng thái: " + ", ".join(f"{KIND_TXT.get(k, k)} {c}" for k, c in ev))
+    L.append("\n<b>Sàn:</b>"); L += cex_health_lines()
+    L.append("\nAPI: " + esc(API.line()))
+    send_long("\n".join(L))
+    for st in STATS.values(): st.reset_day()
+    API.reset()
+def scheduler_loop():
+    last = None
+    while True:
+        time.sleep(20)
+        try:
+            now = datetime.now(VN_TZ)
+            if now.hour == DAILY_REPORT_HOUR and now.minute < 5 and last != now.date():
+                last = now.date(); daily_report()
+            for k, st in STATS.items():
+                if st.last_scan and time.time() - st.last_scan > 3600:
+                    error_alert(f"stuck:{k}", f"Mạng {k} không hoàn thành vòng quét nào trong 1 giờ.")
+        except Exception: log.exception("scheduler loi")
+
+# ============================ LENH TELEGRAM ============================
+def cmd_check(sym):
+    """Chan doan: vi sao token khong duoc bao."""
+    s = norm_sym(sym); lines = [f"🔍 <b>KIỂM TRA {esc(sym)}</b>"]; found = False
+    for ch in CHAINS:
+        for e in MULTI.by_chain.get(ch, []):
+            lst = [l for l in e["listings"] if norm_sym(l["symbol"]) == s]
+            if not lst: continue
+            found = True
+            pools = fetch_dex_pools(ch, [e["contract"]]); pool = (pools or {}).get(e["key"])
+            lines.append(f"\n{CHAINS[ch]['emoji']} <b>{CHAINS[ch]['name']}</b> <code>{esc(e['contract'])}</code>")
+            if not pool:
+                lines.append(f"  ✗ Không có pool đạt lọc (liq ≥ {fmt_usd(MIN_LIQ_USD)}, vol24h ≥ {fmt_usd(MIN_VOL_24H)}, tx1h ≥ {MIN_TXNS_H1}, tuổi ≥ {MIN_POOL_AGE_H:.0f}h)"); continue
+            lines.append(f"  DEX: {len(pool['dexes'])} sàn / {pool['n_pools']} pool · giá TB {fmt_price(pool['price'])} (thấp {fmt_price(pool['price_min'])} - cao {fmt_price(pool['price_max'])}) · liq {fmt_usd(pool['liq_total'])}")
+            lines.append("  " + ", ".join(f"{esc(x['dex'])} {fmt_usd(x['liq'])}" for x in pool["dexes"][:6]))
+            for tok in lst:
+                d = Diag(True); res = check_candidate(ch, tok, pool, d)
+                lines.append(f"  • {tok['cex']}{' (contract suy ra)' if tok.get('inferred') else ''}: nạp {status_icon(tok['deposit_enable'])} rút {status_icon(tok['withdraw_enable'])}")
+                lines += [f"     - {esc(x)}" for x in d.lines[:8]]
+                if res:
+                    ok_txt = ", ".join("%s %+.2f%%" % (p["direction"], p["net_pct"]) for _, _, p in res)
+                    lines.append(f"     ✅ ĐẠT: {ok_txt}")
+    nocontract = [(n, t) for n, ts in MULTI.tokens.items() for t in ts if norm_sym(t["symbol"]) == s and not t["contract"]]
+    for n, t in nocontract[:6]:
+        lines.append(f"• {n} [{t['chain']}]: sàn không công bố contract" + (" và không ghép được (0 hoặc >1 contract cùng symbol)" if not MULTI.resolve(t) else ""))
+    if not found and not nocontract: lines.append("Không thấy token trên các mạng/sàn đang quét (hoặc sàn không có dữ liệu mạng).")
     return "\n".join(lines)
-
 def handle_command(text):
-    parts = text.strip().split()
-    cmd = parts[0].lower().split("@")[0]
-    arg = parts[1].upper() if len(parts) > 1 else ""
+    parts = text.strip().split(); cmd = parts[0].lower().split("@")[0]; arg = parts[1].upper() if len(parts) > 1 else ""
     if cmd in ("/start", "/help"):
-        return ("/status - bot status\n"
-                "/stats - thong ke\n"
-                "/top - 10 signal gan nhat\n"
-                "/hot - token bien dong nhieu\n"
-                "/inventory - vi tri dang hold\n"
-                "/live - gia WS live 9 san\n"
-                "/pause CHAIN /resume CHAIN\n"
-                "/blacklist SYMBOL /unblacklist SYMBOL")
+        return ("<b>Lệnh</b>\n/status - tình trạng bot & sàn\n/check SYMBOL - kiểm tra vì sao token có/không có kèo\n/deposit SYMBOL - nạp/rút theo mạng, theo sàn\n"
+                "/top - 10 kèo gần nhất\n/report - gửi báo cáo ngay\n/networks - tên mạng chưa nhận diện\n/config - cấu hình hiện tại\n"
+                "/pause CHAIN · /resume CHAIN\n/blacklist SYMBOL · /unblacklist SYMBOL")
     if cmd == "/status":
-        lines = [f"<b>STATUS</b> {datetime.now().strftime('%H:%M %d/%m')}"]
+        L = [f"<b>STATUS {VERSION}</b> {datetime.now(VN_TZ).strftime('%H:%M %d/%m')}"] + cex_health_lines() + [""]
         for k, st in STATS.items():
-            s = st.snapshot()
-            lines.append(f"{CHAINS[k]['emoji']} {k}{' (PAUSED)' if k in PAUSED else ''}: sig={s['signals']} opp={s['opportunity']} "
-                         f"realOK={s['real_price_ok']} realFail={s['real_price_fail']} err={s['errors']} thr={adaptive_threshold(k):.2f}")
-        lines.append("API: " + esc(API.line()))
-        return "\n".join(lines)
-    if cmd == "/stats":
-        return summary_text()
+            s = st.snapshot(daily=True); ago = int(time.time() - st.last_scan) if st.last_scan else -1
+            L.append(f"{CHAINS[k]['emoji']} {k}{' (PAUSED)' if k in PAUSED else ''}: token {len(MULTI.by_chain.get(k, []))} · pool {s.get('pools',0)} · ứng viên {s.get('candidates',0)} · kèo {s.get('signals',0)} · vòng cuối {ago}s trước")
+        L.append("\nAPI: " + esc(API.line())); return "\n".join(L)
+    if cmd == "/check": return cmd_check(arg) if arg else "Dùng: /check SYMBOL"
+    if cmd == "/report": daily_report(); return "Đã gửi báo cáo."
+    if cmd == "/networks":
+        with UNKNOWN_LOCK: top = UNKNOWN_NETS.most_common(40)
+        return "<b>Tên mạng chưa nhận diện</b> (thêm qua EXTRA_ALIASES nếu là mạng cần quét):\n" + ", ".join(f"{esc(n)}({c})" for n, c in top)
+    if cmd == "/config":
+        return (f"Lãi ròng ≥ {MIN_NET_PCT}% và ≥ {fmt_usd(MIN_NET_USD)} · size {fmt_usd(ORDER_SIZE_MIN)}–{fmt_usd(ORDER_SIZE_MAX)} (≤ {SIZE_LIQ_MAX_FRAC*100:.0f}% liq)\n"
+                f"Pool: liq ≥ {fmt_usd(MIN_LIQ_USD)}, vol ≥ {fmt_usd(MIN_VOL_24H)}, tx1h ≥ {MIN_TXNS_H1}, tuổi ≥ {MIN_POOL_AGE_H:.0f}h\n"
+                f"Chọn size: {'% lãi cao nhất' if SIZE_MODE == 'pct' else '$ lãi cao nhất'} · quote: {'Kyber + ParaSwap (lấy tốt nhất)' if MULTI_AGG else 'Kyber'}\n"
+                f"Impact ≤ {MAX_IMPACT_PCT}% · trượt CEX ≤ {MAX_CEX_SLIP_PCT}% · tax ≤ {TAX_MAX*100:.0f}% · mạng chưa có nguồn tax: mặc định {NO_SOURCE_TAX*100:.0f}% · tra cứu tax lỗi: {UNKNOWN_TAX_MODE} ({UNKNOWN_TAX_ASSUME*100:.0f}%)\n"
+                f"Contract suy ra: {'bật' if ALLOW_INFERRED_CONTRACT else 'tắt'} · trạng thái chưa xác minh: {'cho phép' if ALLOW_UNVERIFIED_STATUS else 'bỏ qua'}\n"
+                f"Mạng: {', '.join(CHAINS)}\nSàn: {', '.join(EXCHANGES)}")
     if cmd == "/top":
-        rows = DB.recent(10)
-        if not rows:
-            return "Chua co signal."
-        out = ["<b>10 signal gan nhat</b>"]
-        for r in rows:
-            f5 = f"{r['net_pct_5m']:+.2f}%" if r["net_pct_5m"] is not None else (r["st_5m"] or "...")
-            out.append(f"#{r['id']} {esc(r['symbol'])}[{r['chain']}] adj {r['adj_net_pct'] or 0:.2f}% → 5m: {f5}")
-        return "\n".join(out)
+        rows = DB.q("SELECT id,symbol,chain,cex,direction,net_pct,usd,pnl_a,st_a FROM signals ORDER BY id DESC LIMIT 10")
+        if not rows: return "Chưa có kèo."
+        return "<b>10 kèo gần nhất</b>\n" + "\n".join(f"#{i} {esc(s)} [{ch}] {'DEX→' + cx if d == 'DEX_TO_CEX' else cx + '→DEX'} {n:+.2f}% {fmt_usd(u)} → {f'{pa:+.2f}%' if pa is not None else (sa or '...')}" for i, s, ch, cx, d, n, u, pa, sa in rows)
+    if cmd == "/deposit":
+        if not arg: return "Dùng: /deposit SYMBOL"
+        L = [f"<b>NẠP/RÚT {esc(arg)}</b> (❓ = sàn không công bố)"]
+        for n, toks in MULTI.tokens.items():
+            for t in toks:
+                if norm_sym(t["symbol"]) == norm_sym(arg):
+                    fee = "?" if t["withdraw_fee"] is None else fmt_tok(t["withdraw_fee"])
+                    L.append(f"{n} · {CHAINS[t['chain']]['name']} ({esc(t['raw_network'])}): Nạp {status_icon(t['deposit_enable'])} Rút {status_icon(t['withdraw_enable'])} · phí rút {fee}" + ("" if t["contract"] else " · không có contract"))
+        return "\n".join(L) if len(L) > 1 else f"Không thấy {esc(arg)} trên các mạng đang quét."
     if cmd == "/pause":
-        if arg in CHAINS:
-            PAUSED.add(arg); return f"Da pause {arg}"
-        return "Chain khong hop le: " + ", ".join(CHAINS)
-    if cmd == "/resume":
-        PAUSED.discard(arg); return f"Da resume {arg}"
+        if arg in CHAINS: PAUSED.add(arg); return f"Đã tạm dừng {arg}"
+        return "Mạng hợp lệ: " + ", ".join(CHAINS)
+    if cmd == "/resume": PAUSED.discard(arg); return f"Đã chạy lại {arg}"
     if cmd == "/blacklist" and arg:
-        until = time.time() + 7 * 86400
-        with BL_LOCK:
-            BL[f"SYM:{arg}"] = until
-        DB.save_blacklist(f"SYM:{arg}", until, "manual")
-        return f"Da blacklist {esc(arg)} 7 ngay"
+        k = f"SYM:{norm_sym(arg)}"; until = time.time() + 7 * 86400
+        with BL_LOCK: BL[k] = until
+        DB.q("INSERT OR REPLACE INTO blacklist VALUES(?,?,?)", (k, until, "manual"), commit=True); return f"Đã blacklist {esc(arg)} 7 ngày"
     if cmd == "/unblacklist" and arg:
-        with BL_LOCK:
-            BL.pop(f"SYM:{arg}", None)
-        DB.del_blacklist(f"SYM:{arg}")
-        return f"Da go blacklist {esc(arg)}"
-    if cmd == "/hot":
-        try:
-            hot = INV_DB.get_hot(15)
-            if not hot:
-                return "Chua co HOT token nao"
-            lines = ["<b>🔥 HOT TOKENS (bien dong nhieu)</b>"]
-            for sym, contract, chain, hits, pot in hot:
-                lines.append(f"{esc(sym)} [{chain}] hits={hits} profit~{pot:.1f}% - Hold ${ORDER_SIZE_MIN}-{ORDER_SIZE_MAX}")
-            return "\n".join(lines)
-        except Exception as e:
-            return f"Hot loi {e}"
-    if cmd == "/inventory":
-        try:
-            inv = INV_DB.list_active()
-            if not inv:
-                return "Chua co inventory. Khi token HOT, bot se de xuat hold 50% DEX + 50% CEX"
-            lines = ["<b>📦 INVENTORY AUTO-HOLD</b>"]
-            for sym, contract, chain, cex, dex_amt, cex_amt, avg, prof in inv[:15]:
-                lines.append(f"{esc(sym)} {chain}/{cex}: DEX {dex_amt:.2f} + CEX {cex_amt:.2f} avg ${avg:.4f}")
-            return "\n".join(lines)
-        except Exception as e:
-            return f"Inventory loi {e}"
-    if cmd == "/live":
-        try:
-            with CEX_LIVE_LOCK:
-                lines = [f"<b>📡 LIVE PRICES WS ({len(CEX_LIVE)} CEXs)</b>"]
-                for cex, pairs in CEX_LIVE.items():
-                    lines.append(f"--- {cex} ---")
-                    for sym, d in list(pairs.items())[:5]:
-                        age = int(time.time()-d["ts"])
-                        lines.append(f"{sym}: bid {d['bid']} ask {d['ask']} ({d['source']} {age}s)")
-            return "\n".join(lines[:30])
-        except Exception as e:
-            return f"Live loi {e}"
-    return "Lenh khong hop le. /help"
-
+        k = f"SYM:{norm_sym(arg)}"
+        with BL_LOCK: BL.pop(k, None)
+        DB.q("DELETE FROM blacklist WHERE key=?", (k,), commit=True); return f"Đã gỡ blacklist {esc(arg)}"
+    return "Lệnh không hợp lệ. /help"
 def telegram_poll_loop():
     offset = None
     while True:
         try:
-            r = session().get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                              params={"timeout": 25, "offset": offset}, timeout=35)
-            if r.status_code == 409:
-                time.sleep(30); continue
-            if r.status_code != 200:
-                time.sleep(10); continue
+            r = session().get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates", params={"timeout": 25, "offset": offset}, timeout=35)
+            if r.status_code == 409: log.warning("Telegram 409: co 2 ban bot dang chay cung token!"); time.sleep(30); continue
+            if r.status_code != 200: time.sleep(10); continue
             for u in r.json().get("result", []):
-                offset = u["update_id"] + 1
-                m = u.get("message") or {}
-                if str((m.get("chat") or {}).get("id")) != CHAT_ID or not m.get("text", "").startswith("/"):
-                    continue
-                try:
-                    send_telegram(handle_command(m["text"]))
-                except:
-                    log.exception("Lenh loi")
-        except Exception as e:
-            log.warning("Poll Telegram loi: %s", e)
-            time.sleep(10)
+                offset = u["update_id"] + 1; m = u.get("message") or {}
+                if str((m.get("chat") or {}).get("id")) != CHAT_ID or not m.get("text", "").startswith("/"): continue
+                def run(txt=m["text"]):
+                    try: send_long(handle_command(txt))
+                    except Exception: log.exception("lenh loi")
+                threading.Thread(target=run, daemon=True).start()
+        except Exception as e: log.warning("Poll Telegram loi: %s", e); time.sleep(10)
 
-def check_candidate(chain_key, tok, pool):
-    st = STATS[chain_key]
+# ============================ WEB (Render can cong mo) ============================
+def start_web():
     try:
-        depth = mexc_depth(tok["pair"])
-        if not depth:
-            return None
-        st.inc("fetched"); st.success()
-        thr = adaptive_threshold(chain_key)
-        best = None
-        for p in evaluate(chain_key, tok, pool, depth):
-            if p["gross_pct"] >= PREFILTER_GROSS:
-                st.inc("opportunity")
-            if p["adj_net_pct"] >= thr and (not best or p["adj_net_pct"] > best["adj_net_pct"]):
-                best = p
-        return (tok, pool, best) if best else None
-    except:
-        st.inc("errors")
-        log.exception("Loi xu ly %s %s", chain_key, tok["symbol"])
-        return None
+        from flask import Flask, jsonify, request
+    except ImportError:
+        import http.server, socketserver
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(f"{VERSION} OK".encode())
+            def log_message(self, *a): pass
+        socketserver.TCPServer(("0.0.0.0", PORT), H).serve_forever(); return
+    app = Flask(__name__)
+    def authed(): return bool(ADMIN_TOKEN) and hmac.compare_digest(request.args.get("token") or "", ADMIN_TOKEN)
+    @app.route("/")
+    def home(): return f"{VERSION} CEX-DEX bot OK"
+    @app.route("/health")
+    def health(): return "OK", 200
+    @app.route("/signals")
+    def signals():
+        if not authed(): return "forbidden", 403
+        return jsonify([dict(zip(("id","ts","chain","cex","symbol","direction","usd","net_pct","pnl_a"), r)) for r in DB.q("SELECT id,ts,chain,cex,symbol,direction,usd,net_pct,pnl_a FROM signals ORDER BY id DESC LIMIT 100")])
+    try:
+        from waitress import serve; serve(app, host="0.0.0.0", port=PORT)
+    except ImportError: app.run(host="0.0.0.0", port=PORT)
 
-def prefilter(chain_key, tok, pool, book):
-    bt = book.get(tok["pair"])
-    if not bt:
-        return False
-    bid, ask = bt
-    f = pool["fee"]
-    imp = (2 * ORDER_SIZE_USD / max(pool["liq"], 1)) * 0.5
-    buy_px, sell_px = pool["price"] * (1 + f + imp), pool["price"] * (1 - f - imp)
-    g1 = (sell_px / ask - 1) * 100 if tok.get("withdraw_enable", True) else -99
-    g2 = (bid / buy_px - 1) * 100 if tok.get("deposit_enable", True) else -99
-    return max(g1, g2) >= PREFILTER_GROSS
-
-def scan_chain_once(chain_key, stop):
-    st = STATS[chain_key]
-    MEXC.ensure_static()
-    tokens = MEXC.tokens.get(chain_key, [])
-    if not tokens:
-        return False
-    book = MEXC.get_book()
-    if not book:
-        return False
-    for i in range(0, len(tokens), DEX_BATCH):
-        if stop.is_set():
-            return True
-        if chain_key in PAUSED:
-            stop.wait(5); return True
-        st.beat()
-        chunk = tokens[i:i + DEX_BATCH]
-        pools = fetch_dex_pools(chain_key, [t["contract"] for t in chunk])
-        if pools is None:
-            st.inc("errors"); continue
-        candidates = []
-        for tok in chunk:
-            pool = pools.get(tok["dedup_key"])
-            if not pool or not symbol_ok(tok["symbol"], pool["base_symbol"]):
-                continue
-            st.inc("attempted")
-            if is_blacklisted(chain_key, tok):
-                st.inc("blacklisted_skip"); continue
-            if prefilter(chain_key, tok, pool, book):
-                candidates.append((tok, pool))
-        if candidates:
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                results = list(ex.map(lambda c: check_candidate(chain_key, c[0], c[1]), candidates))
-            for res in sorted([r for r in results if r], key=lambda r: -r[2]["adj_net_pct"]):
-                tok, pool, p = res
-                key = (chain_key, tok["dedup_key"], p["direction"])
-                if not should_alert(key, p["adj_net_pct"]):
-                    continue
-                if send_alert(chain_key, tok, pool, p):
-                    mark_alerted(key, p["adj_net_pct"])
-                    st.inc("signals")
-                    DB.insert(chain_key, tok, pool, p)
-        stop.wait(2.5)
-    return True
-
-def run_chain_loop(chain_key, stop):
-    log.info("[%s] start",chain_key)
-    empty, warned = 0, False
-    while not stop.is_set():
-        try:
-            STATS[chain_key].beat()
-            if not scan_chain_once(chain_key, stop):
-                empty += 1
-                log.info("[%s] chua co du lieu (%d), thu lai sau", chain_key, empty)
-                stop.wait(60 if empty <= 10 else 300)
-                continue
-            empty = 0
-            if STATS[chain_key].snapshot()["dex_pairs"] == 0:
-                log.warning("[%s] Dexscreener khong tra pair nao (slug '%s' sai?)", chain_key, CHAINS[chain_key]["dex_chain"])
-                if not warned:
-                    warned = True
-                    send_telegram(f"⚠ {esc(chain_key)}: Dexscreener khong tra pair nao cho slug <code>{esc(CHAINS[chain_key]['dex_chain'])}</code>.")
-                stop.wait(3600)
-                continue
-            stop.wait(SCAN_PAUSE_SEC)
-        except:
-            STATS[chain_key].inc("errors")
-            log.exception("[%s] loi vong chinh", chain_key)
-            stop.wait(20)
-
-
-# ========== V8.9 INVENTORY AUTO-HOLD ==========
-INVENTORY_DB_PATH = os.getenv("INVENTORY_DB_PATH", "inventory.db")
-
-class InventoryDB:
-    def __init__(self, path):
-        self.lock = threading.Lock()
-        self.conn = sqlite3.connect(path, check_same_thread=False)
-        with self.lock:
-            c=self.conn
-            try: c.execute("PRAGMA journal_mode=WAL")
-            except: pass
-            c.execute("""CREATE TABLE IF NOT EXISTS inventory(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT, contract TEXT, chain TEXT, cex TEXT,
-                dex_amount REAL DEFAULT 0, cex_amount REAL DEFAULT 0,
-                avg_price REAL DEFAULT 0, profit_total REAL DEFAULT 0,
-                created_ts REAL, updated_ts REAL, status TEXT DEFAULT 'active')""")
-            c.execute("""CREATE TABLE IF NOT EXISTS hot_tokens(
-                symbol TEXT PRIMARY KEY, contract TEXT, chain TEXT,
-                hits INTEGER, first_seen REAL, last_seen REAL, profit_potential REAL)""")
-            c.commit()
-    def add_or_update(self, symbol, contract, chain, cex, dex_amt, cex_amt, price):
-        with self.lock:
-            cur=self.conn.execute("SELECT id, dex_amount, cex_amount FROM inventory WHERE symbol=? AND contract=? AND chain=? AND cex=? AND status='active'",
-                                  (symbol, contract, chain, cex))
-            row=cur.fetchone()
-            now=time.time()
-            if row:
-                nid, od, oc = row
-                self.conn.execute("UPDATE inventory SET dex_amount=?, cex_amount=?, avg_price=?, updated_ts=? WHERE id=?",
-                                  (od+dex_amt, oc+cex_amt, price, now, nid))
-            else:
-                self.conn.execute("INSERT INTO inventory(symbol,contract,chain,cex,dex_amount,cex_amount,avg_price,created_ts,updated_ts) VALUES(?,?,?,?,?,?,?,?,?)",
-                                  (symbol, contract, chain, cex, dex_amt, cex_amt, price, now, now))
-            self.conn.commit()
-    def list_active(self):
-        with self.lock:
-            cur=self.conn.execute("SELECT symbol, contract, chain, cex, dex_amount, cex_amount, avg_price, profit_total FROM inventory WHERE status='active'")
-            return cur.fetchall()
-    def record_hot(self, symbol, contract, chain, profit_potential=0):
-        with self.lock:
-            cur=self.conn.execute("SELECT hits FROM hot_tokens WHERE symbol=?", (symbol,))
-            r=cur.fetchone()
-            now=time.time()
-            if r:
-                self.conn.execute("UPDATE hot_tokens SET hits=hits+1, last_seen=?, profit_potential=? WHERE symbol=?", (now, profit_potential, symbol))
-            else:
-                self.conn.execute("INSERT INTO hot_tokens(symbol,contract,chain,hits,first_seen,last_seen,profit_potential) VALUES(?,?,?,?,?,?,?)",
-                                  (symbol, contract, chain, 1, now, now, profit_potential))
-            self.conn.commit()
-    def get_hot(self, limit=20):
-        with self.lock:
-            cur=self.conn.execute("SELECT symbol, contract, chain, hits, profit_potential FROM hot_tokens ORDER BY hits DESC, profit_potential DESC LIMIT ?", (limit,))
-            return cur.fetchall()
-
-INV_DB = InventoryDB(INVENTORY_DB_PATH)
-
-# ========== V8.9 WEBSOCKET LIVE FULL 9 SAN ==========
-try:
-    import websocket as _ws_lib
-    HAS_WS = True
-except:
-    HAS_WS = False
-    log.warning("websocket-client not installed, WS disabled - pip install websocket-client")
-
-class CEXWebSocketManager:
-    def __init__(self):
-        self.threads = {}
-        self.stop_flags = {}
-    
-    def start_all(self):
-        if not HAS_WS:
-            log.warning("WS disabled, using REST poll")
-        for cex in ENABLED_CEXS:
-            cex = cex.strip().upper()
-            if cex not in CEX_REGISTRY:
-                continue
-            flag = threading.Event()
-            self.stop_flags[cex]=flag
-            t = threading.Thread(target=self._run_cex_ws, args=(cex, flag), daemon=True, name=f"WS-{cex}")
-            t.start()
-            self.threads[cex]=t
-            time.sleep(0.3)
-    
-    def _run_cex_ws(self, cex, stop_flag):
-        cfg = CEX_REGISTRY[cex]
-        fmt = cfg.get("ws_format")
-        log.info("WS %s starting (%s)", cex, fmt)
-        while not stop_flag.is_set():
-            try:
-                if fmt=="mexc":
-                    self._run_mexc_ws(cex, stop_flag)
-                elif fmt=="binance":
-                    self._run_binance_ws(cex, stop_flag)
-                elif fmt=="gate":
-                    self._run_gate_ws(cex, stop_flag)
-                elif fmt=="okx":
-                    self._run_okx_ws(cex, stop_flag)
-                elif fmt=="bybit":
-                    self._run_bybit_ws(cex, stop_flag)
-                elif fmt=="bitget":
-                    self._run_bitget_ws(cex, stop_flag)
-                elif fmt=="kucoin":
-                    self._run_kucoin_ws(cex, stop_flag)
-                elif fmt=="htx":
-                    self._run_htx_ws(cex, stop_flag)
-                else:
-                    self._run_rest_poll_ws(cex, stop_flag)
-            except Exception as e:
-                log.warning("WS %s error %s, reconnect 5s", cex, e)
-                time.sleep(5)
-    
-    def _run_mexc_ws(self, cex, stop_flag):
-        import websocket, json
-        url = "wss://wbs.mexc.com/ws"
-        def on_open(ws):
-            subs = [f"spot@public.bookTicker.v3.api@{p}" for p in ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","PEPEUSDT","WIFUSDT","BONKUSDT","SHIBUSDT"][:30]]
-            ws.send(json.dumps({"method":"SUBSCRIPTION","params":subs}))
-            log.info("MEXC WS subscribed %d pairs", len(subs))
-        def on_msg(ws, msg):
-            try:
-                data = json.loads(msg)
-                if "d" in data and "c" in data:
-                    d=data["d"]; sym=data["c"].split("@")[-1]
-                    bid=d.get("bidPrice"); ask=d.get("askPrice")
-                    if bid and ask:
-                        update_live_price(cex, sym, bid, ask, "ws")
-            except:
-                pass
-        ws = websocket.WebSocketApp("wss://wbs.mexc.com/ws", on_open=on_open, on_message=on_msg)
-        ws.run_forever(ping_interval=20, ping_timeout=10)
-    
-    def _run_binance_ws(self, cex, stop_flag):
-        import websocket, json
-        symbols = ["btcusdt","ethusdt","solusdt","bnbusdt","pepeusdt","wifusdt","bonkusdt","shibusdt","flokiusdt","dogusdt"]
-        url = f"wss://stream.binance.com:9443/ws/{'/'.join([s+'@bookTicker' for s in symbols])}"
-        def on_msg(w, msg):
-            try:
-                d=json.loads(msg)
-                if "s" in d:
-                    update_live_price(cex, d["s"], d.get("b"), d.get("a"), "ws")
-            except:
-                pass
-        ws = websocket.WebSocketApp(url, on_message=on_msg)
-        ws.run_forever(ping_interval=20)
-    
-    def _run_gate_ws(self, cex, stop_flag):
-        # Gate.io WS v4 - subscribe to tickers
-        import websocket, json
-        def on_open(ws):
-            # Gate needs subscription: {"time":..., "channel":"spot.tickers", "event":"subscribe", "payload":["BTC_USDT","ETH_USDT"]}
-            payload = ["BTC_USDT","ETH_USDT","SOL_USDT","PEPE_USDT","WIF_USDT","BONK_USDT","SHIB_USDT"]
-            msg = {"time": int(time.time()), "channel": "spot.tickers", "event": "subscribe", "payload": payload}
-            ws.send(json.dumps(msg))
-        def on_msg(ws, msg):
-            try:
-                data=json.loads(msg)
-                if data.get("channel")=="spot.tickers":
-                    result=data.get("result",{})
-                    if isinstance(result, dict):
-                        pair=result.get("currency_pair","").replace("_","")
-                        bid=result.get("highest_bid"); ask=result.get("lowest_ask")
-                        if bid and ask:
-                            update_live_price(cex, pair, bid, ask, "ws")
-            except:
-                pass
-        ws = websocket.WebSocketApp("wss://api.gateio.ws/ws/v4/", on_open=on_open, on_message=on_msg)
-        ws.run_forever(ping_interval=20)
-    
-    def _run_okx_ws(self, cex, stop_flag):
-        import websocket, json
-        def on_open(ws):
-            # OKX subscribe to tickers
-            args = [{"channel":"tickers","instId":"BTC-USDT"},{"channel":"tickers","instId":"ETH-USDT"},{"channel":"tickers","instId":"SOL-USDT"},{"channel":"tickers","instId":"PEPE-USDT"}]
-            ws.send(json.dumps({"op":"subscribe","args":args}))
-        def on_msg(ws, msg):
-            try:
-                data=json.loads(msg)
-                if "data" in data:
-                    for t in data["data"]:
-                        inst=t.get("instId","").replace("-","")
-                        bid=t.get("bidPx"); ask=t.get("askPx")
-                        if bid and ask:
-                            update_live_price(cex, inst, bid, ask, "ws")
-            except:
-                pass
-        ws = websocket.WebSocketApp("wss://ws.okx.com:8443/ws/v5/public", on_open=on_open, on_message=on_msg)
-        ws.run_forever(ping_interval=20)
-    
-    def _run_bybit_ws(self, cex, stop_flag):
-        import websocket, json
-        def on_open(ws):
-            ws.send(json.dumps({"op":"subscribe","args":["tickers.BTCUSDT","tickers.ETHUSDT","tickers.SOLUSDT","tickers.PEPEUSDT"]}))
-        def on_msg(ws, msg):
-            try:
-                data=json.loads(msg)
-                if data.get("topic","").startswith("tickers."):
-                    d=data.get("data",{})
-                    sym=d.get("symbol")
-                    bid=d.get("bid1Price"); ask=d.get("ask1Price")
-                    if sym and bid and ask:
-                        update_live_price(cex, sym, bid, ask, "ws")
-            except:
-                pass
-        ws = websocket.WebSocketApp("wss://stream.bybit.com/v5/public/spot", on_open=on_open, on_message=on_msg)
-        ws.run_forever(ping_interval=20)
-    
-    def _run_bitget_ws(self, cex, stop_flag):
-        import websocket, json
-        def on_open(ws):
-            args = [{"instType":"SPOT","channel":"ticker","instId":"BTCUSDT"},{"instType":"SPOT","channel":"ticker","instId":"ETHUSDT"}]
-            ws.send(json.dumps({"op":"subscribe","args":args}))
-        def on_msg(ws, msg):
-            try:
-                data=json.loads(msg)
-                if "data" in data:
-                    for t in data["data"]:
-                        sym=t.get("instId")
-                        bid=t.get("bidPr"); ask=t.get("askPr")
-                        if sym and bid and ask:
-                            update_live_price(cex, sym, bid, ask, "ws")
-            except:
-                pass
-        ws = websocket.WebSocketApp("wss://ws.bitget.com/v2/ws/public", on_open=on_open, on_message=on_msg)
-        ws.run_forever(ping_interval=20)
-    
-    def _run_kucoin_ws(self, cex, stop_flag):
-        # Kucoin needs token first, fallback to REST poll for simplicity in V8.9
-        self._run_rest_poll_ws(cex, stop_flag)
-    
-    def _run_htx_ws(self, cex, stop_flag):
-        import websocket, json, gzip
-        def on_open(ws):
-            subs = [{"sub":"market.btcusdt.ticker"},{"sub":"market.ethusdt.ticker"},{"sub":"market.solusdt.ticker"}]
-            for s in subs:
-                ws.send(json.dumps(s))
-        def on_msg(ws, msg):
-            try:
-                # HTX sends gzip
-                if isinstance(msg, bytes):
-                    msg = gzip.decompress(msg).decode()
-                data=json.loads(msg)
-                if "ping" in data:
-                    ws.send(json.dumps({"pong": data["ping"]}))
-                if "tick" in data and "ch" in data:
-                    ch=data["ch"]
-                    # ch = market.btcusdt.ticker
-                    sym=ch.split(".")[1].upper()
-                    tick=data["tick"]
-                    bid=tick.get("bid"); ask=tick.get("ask")
-                    if bid and ask:
-                        update_live_price(cex, sym, bid, ask, "ws")
-            except:
-                pass
-        ws = websocket.WebSocketApp("wss://api.huobi.pro/ws", on_open=on_open, on_message=on_msg)
-        ws.run_forever()
-    
-    def _run_rest_poll_ws(self, cex, stop_flag):
-        # Universal REST poll fallback - 3s loop for all remaining CEXs
-        while not stop_flag.is_set():
-            try:
-                ad = CEX_ADAPTERS.get(cex)
-                if not ad:
-                    time.sleep(3)
-                    continue
-                tickers = ad.fetch_tickers()
-                for sym, data in list(tickers.items())[:100]:
-                    if data.get("bid") and data.get("ask"):
-                        update_live_price(cex, sym, data["bid"], data["ask"], "rest-poll")
-                # also fetch MEXC-like depth for best price calc
-                time.sleep(3)
-            except Exception as e:
-                log.debug("REST poll %s fail %s", cex, e)
-                time.sleep(5)
-
-WS_MANAGER = CEXWebSocketManager()
-
-class Worker:
-    def __init__(self, chain_key):
-        self.chain = chain_key; self.stop = None; self.thread = None
-    def start(self):
-        self.stop = threading.Event()
-        STATS[self.chain].beat()
-        self.thread = threading.Thread(target=run_chain_loop, args=(self.chain, self.stop),daemon=True, name=f"Bot-{self.chain}")
-        self.thread.start()
-    def restart(self):
-        if self.stop:
-            self.stop.set()
-        if self.thread:
-            self.thread.join(timeout=5)
-        self.start()
-
-def heartbeat_loop():
-    last_sent = None
+def keepalive_loop():
+    """Render goi Free tat service sau ~15 phut khong co request -> tu ping URL cong khai cua chinh minh."""
+    url = env_str("RENDER_EXTERNAL_URL") or env_str("KEEPALIVE_URL")
+    if not KEEPALIVE or not url: return
+    log.info("Keepalive: ping %s/health moi 10 phut", url)
     while True:
-        try:
-            # VN time = UTC+7
-            now_utc = datetime.utcnow()
-            now_vn = now_utc + __import__("datetime").timedelta(hours=7)
-            # 21:00 VN
-            if now_vn.hour == 21 and now_vn.minute < 2:
-                today = now_vn.date()
-                if last_sent != today:
-                    msg = (f"📊 <b>DAILY REPORT {now_vn.strftime('%d/%m/%Y')} - 21:00</b>\n"
-                           f"Capital: ${ORDER_SIZE_USD:.0f} | Real: {REAL_PRICE_CHECK} | Require: {REQUIRE_REAL_PRICE}\n"
-                           f"{'─'*20}\n")
-                    total_sig = 0
-                    for k, st in STATS.items():
-                        s = st.snapshot()
-                        if s['attempted'] == 0:
-                            continue
-                        total_sig += s['signals']
-                        thr = adaptive_threshold(k)
-                        msg += (f"{CHAINS[k]['emoji']} <b>{k}</b>: "
-                                f"Scanned {s['attempted']} | Fetched {s['fetched']} | Opp {s['opportunity']} | "
-                                f"✅ {s['signals']} | Sus {s['suspect']}\n"
-                                f"   RealOK {s['real_price_ok']} | Fail {s['real_price_fail']} | Thr {thr:.2f}%\n")
-                    msg += f"\n{'─'*20}\nAPI: {esc(API.line())}\n\n{summary_text(8)}"
-                    send_telegram(msg)
-                    last_sent = today
-            time.sleep(60)
-        except Exception as e:
-            log.exception("Heartbeat loi: %s", e)
-            time.sleep(60)
+        time.sleep(600)
+        try: requests.get(url.rstrip("/") + "/health", timeout=20)
+        except Exception as e: log.debug("keepalive loi %s", e)
 
 def cleanup():
     now = time.time()
     with CD_LOCK:
-        for k in [k for k, (t, _) in COOLDOWN.items() if (datetime.now() - t).total_seconds() > COOLDOWN_MIN * 60 * 4]:
-            COOLDOWN.pop(k, None)
-    with SEC_LOCK:
-        for k in [k for k, (ts, _) in SEC_CACHE.items() if now - ts > 21600]:
-            SEC_CACHE.pop(k, None)
+        for k in [k for k, (t, _) in COOLDOWN.items() if now - t > 6 * 3600]: COOLDOWN.pop(k, None)
+    with FS_LOCK:
+        for k in [k for k, v in FIRST_SEEN.items() if now - v[1] > 3600]: FIRST_SEEN.pop(k, None)
     with BL_LOCK:
-        for k in [k for k, u in BL.items() if u < now]:
-            BL.pop(k, None)
+        for k in [k for k, u in BL.items() if u < now]: BL.pop(k, None)
 
-def start_web():
-    from flask import Flask, jsonify, request
-    app = Flask(__name__)
-    def authed():
-        return (not ADMIN_TOKEN) or request.args.get("token") == ADMIN_TOKEN
-    @app.route("/")
-    def home():
-        return f"V8.1 FINAL MERGED - signals: {sum(s.snapshot()['signals'] for s in STATS.values())}"
-    @app.route("/health")
-    def health():
-        return "OK", 200
-    @app.route("/stats")
-    def stats():
-        if not authed():
-            return "forbidden", 403
-        return jsonify({k: s.snapshot() for k, s in STATS.items()})
-    @app.route("/signals")
-    def signals():
-        if not authed():
-            return "forbidden", 403
-        return jsonify(DB.recent(50))
-    @app.route("/summary")
-    def summary():
-        if not authed():
-            return "forbidden", 403
-        return jsonify(DB.summary())
-    log.info("Web tren 0.0.0.0:%s", PORT)
-    try:
-        from waitress import serve
-        serve(app, host="0.0.0.0", port=PORT)
-    except ImportError:
-        app.run(host="0.0.0.0", port=PORT)
-
-def validate_config():
-    warns = []
-    min_liq_needed = 2 * ORDER_SIZE_USD / (MAX_IMPACT_PCT * 1.5) * 100
-    if MIN_LIQ_USD < min_liq_needed:
-        warns.append(f"MIN_LIQ_USD={MIN_LIQ_USD:.0f} thap hon muc can (~{min_liq_needed:.0f})")
-    if not REAL_PRICE_CHECK and REQUIRE_REAL_PRICE:
-        warns.append("REAL_PRICE_CHECK=0 nhung REQUIRE_REAL_PRICE=1 -> bot se khong gui signal")
-    for k in CHAINS:
-        if k not in REAL_CHAINS and REQUIRE_REAL_PRICE:
-            # V8.1: cho phep all chain, chi canh bao nhe
-            log.info("INFO: %s chua ho tro quote that -> se dung gia estimate + buffer cao hon", k)
-    for w in warns:
-        log.warning("CONFIG: %s", w)
-    return warns
-
-def ticker_loop():
-    while True:
-        try:
-            MEXC.fetch_all_tickers()
-        except Exception as e:
-            log.debug("ticker_loop fail %s", e)
-        time.sleep(5)
+def startup_report():
+    MULTI.first_done.wait(timeout=240)
+    warn = []
+    for ch, cfg in CHAINS.items():
+        if cfg["kind"] == "evm" and not cfg.get("rpc") and not cfg.get("blockscout"): warn.append(f"{ch}: thiếu RPC_{ch} → không đọc được decimals")
+        if cfg["kind"] == "evm" and cfg.get("chain_id") not in GOPLUS_CHAINS | HONEYPOT_CHAINS: warn.append(f"{ch}: chưa có nguồn kiểm tra tax → tax mặc định {NO_SOURCE_TAX*100:.0f}%")
+    for n, h in MULTI.health.items():
+        if h.get("err") and ("403" in h["err"] or "451" in h["err"]): warn.append(f"{n} chặn IP server → đổi region server (Singapore/Frankfurt/Tokyo)")
+    L = [f"🚀 <b>BOT {VERSION} đã khởi động</b>",
+         f"Mạng: {', '.join(CHAINS)}",
+         f"Báo khi lãi ròng ≥ {MIN_NET_PCT}% & ≥ {fmt_usd(MIN_NET_USD)} · size động {fmt_usd(ORDER_SIZE_MIN)}–{fmt_usd(ORDER_SIZE_MAX)}",
+         f"Báo cáo ngày: {DAILY_REPORT_HOUR}:00 (UTC+7)", "", "<b>Sàn:</b>"] + cex_health_lines()
+    tot = {k: len(v) for k, v in MULTI.by_chain.items()}
+    L.append("\nToken theo mạng: " + ", ".join(f"{k}={v}" for k, v in tot.items()))
+    if ALLOW_UNVERIFIED_STATUS: warn.append("ALLOW_UNVERIFIED_STATUS=1 → có thể báo kèo khi sàn chưa xác minh nạp/rút. Nên đặt 0")
+    if OBSOLETE_ENV: warn.append("Biến env cũ không còn dùng, nên xoá: " + ", ".join(OBSOLETE_ENV))
+    if not env_str("RENDER_EXTERNAL_URL") and not env_str("KEEPALIVE_URL"): warn.append("Không thấy RENDER_EXTERNAL_URL → keepalive tắt, gói Free có thể ngủ")
+    if warn: L += ["", "<b>Lưu ý:</b>"] + [f"⚠ {esc(w)}" for w in warn]
+    L.append("\nGõ /help để xem lệnh, /check SYMBOL để kiểm tra 1 token.")
+    send_long("\n".join(L))
 
 def main():
-    log.info("BOT V8.9 MULTI-CEX 9 SAN + WS LIVE + INVENTORY start | chains=%s | CEXs=%s", list(CHAINS), ENABLED_CEXS)
-    warns = validate_config()
+    log.info("BOT %s | chains=%s | cex=%s", VERSION, list(CHAINS), list(EXCHANGES))
     threading.Thread(target=start_web, daemon=True, name="Web").start()
-    try:
-        WS_MANAGER.start_all()
-        log.info("WS Manager started for CEXs: %s", ENABLED_CEXS)
-    except Exception as e:
-        log.warning("WS start fail %s", e)
-    threading.Thread(target=ticker_loop, daemon=True, name="Ticker").start()
-    threading.Thread(target=followup_loop, daemon=True, name="Followup").start()
-    threading.Thread(target=heartbeat_loop, daemon=True, name="HB").start()
-    threading.Thread(target=telegram_poll_loop, daemon=True, name="TGPoll").start()
-    send_telegram(f"🚀 <b>BOT V8.9 MULTI-CEX 9 SAN + WS LIVE + INVENTORY</b>\n"
-                  f"Chains: {', '.join(CHAINS)}\nCEXs: {', '.join(ENABLED_CEXS)}\n"
-                  f"Net≥{THRESHOLD_NET}% | Size ${ORDER_SIZE_MIN:.0f}-${ORDER_SIZE_MAX:.0f} dynamic | AI≥{AI_SCORE_MIN}\n"
-                  f"WS Live: {HAS_WS} | Inventory: ON | RealCheck={REAL_PRICE_CHECK}\n"
-                  f"Filter: Liq≥${MIN_LIQ_USD:.0f} Vol≥${MIN_VOL_24H:.0f} Txns≥{MIN_TXNS_H1}\n"
-                  f"Cmd: /help /hot /inventory /live" + ("".join("\n⚠ " + esc(w) for w in warns)))
+    threading.Thread(target=telegram_poll_loop, daemon=True, name="TG").start()
+    threading.Thread(target=followup_loop, daemon=True, name="Follow").start()
+    threading.Thread(target=scheduler_loop, daemon=True, name="Sched").start()
+    threading.Thread(target=keepalive_loop, daemon=True, name="Keepalive").start()
+    threading.Thread(target=MULTI.ensure, daemon=True, name="Init").start()
+    threading.Thread(target=startup_report, daemon=True, name="Startup").start()
+    MULTI.first_done.wait(timeout=240)
     workers = {}
     for k in CHAINS:
-        w = Worker(k); w.start(); workers[k] = w
-        time.sleep(1.2)
+        w = Worker(k); w.start(); workers[k] = w; time.sleep(1.0)
     while True:
-        time.sleep(300)
-        cleanup()
-        now = datetime.now()
+        time.sleep(120); cleanup()
         for k, w in workers.items():
-            idle = (now - STATS[k].last_beat).total_seconds()
-            if not w.thread.is_alive() or idle > STUCK_SEC:
-                log.warning("[SUPERVISOR] %s %s -> restart", k, "chet" if not w.thread.is_alive() else f"dung {int(idle)}s")
-                w.restart()
-            else:
-                log.info("[SUPERVISOR] %s OK, beat %ds truoc", k, int(idle))
+            if not w.thread.is_alive() or time.time() - STATS[k].last_beat > STUCK_SEC:
+                log.warning("[SUPERVISOR] khoi dong lai %s", k); w.restart()
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
