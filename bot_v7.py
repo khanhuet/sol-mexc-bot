@@ -24,7 +24,7 @@ from urllib.parse import urlencode, quote as urlquote
 from zoneinfo import ZoneInfo
 import requests
 
-VERSION = "V11.1"
+VERSION = "V11.2"
 try: VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 except Exception: VN_TZ = timezone(timedelta(hours=7))
 
@@ -39,7 +39,7 @@ def _missing_env_server(missing):
     """Thieu env bat buoc: KHONG thoat (tranh Render bao 'No open ports' + vong khoi dong lai),
     mo cong PORT tra ve thong bao loi va ghi log moi 60s cho den khi duoc cau hinh."""
     import http.server, socketserver
-    msg = f"BOT CHUA CHAY - thieu bien moi truong: {', '.join(missing)}. Vao Render > Environment de them roi Save."
+    msg = f"BOT NOT RUNNING - missing environment variables: {', '.join(missing)}. Add them in Render > Environment and Save."
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.end_headers(); self.wfile.write(msg.encode())
@@ -264,9 +264,9 @@ def jget(r, *path, default=None):
         if d is None: return default
     return d
 def http_err(r, what):
-    if r is None: return RuntimeError(f"{what}: khong phan hoi / timeout")
+    if r is None: return RuntimeError(f"{what}: no response / timeout")
     hint = ""
-    if r.status_code in (403, 451): hint = " (IP server co the bi san chan theo khu vuc)"
+    if r.status_code in (403, 451): hint = " (server IP may be geo-blocked by the exchange)"
     return RuntimeError(f"{what}: HTTP {r.status_code}{hint}")
 
 def esc(s): return html.escape(str(s), quote=False)
@@ -363,9 +363,9 @@ class ApiHealth:
             if ok: s["ok"] += 1; s["consec"] = 0
             else: s["fail"] += 1; s["consec"] += 1
             consec = s["consec"]
-        if consec == 30: error_alert(f"api:{name}", f"API <b>{esc(name)}</b> loi lien tuc {consec} lan - ket qua quet co the thieu.")
+        if consec == 30: error_alert(f"api:{name}", f"API <b>{esc(name)}</b> failed {consec} times in a row - scan results may be incomplete.")
     def line(self):
-        with self.lock: return " | ".join(f"{k}: {v['ok']}✓/{v['fail']}✗" for k, v in sorted(self.d.items())) or "chua co"
+        with self.lock: return " | ".join(f"{k}: {v['ok']}✓/{v['fail']}✗" for k, v in sorted(self.d.items())) or "none yet"
     def reset(self):
         with self.lock:
             for v in self.d.values(): v["ok"] = v["fail"] = 0
@@ -472,7 +472,7 @@ class MexcEx(Exchange):
         qs, sig = signed_query(sec, {"recvWindow": 10000, "timestamp": int(time.time() * 1000)})
         r = http_get(f"{self.BASE}/api/v3/capital/config/getall?{qs}&signature={sig}", headers={"X-MEXC-APIKEY": k}, limiter=self.lim, timeout=25)
         data = jget(r)
-        if not isinstance(data, list): raise http_err(r, "MEXC capital/config (kiem tra API key)")
+        if not isinstance(data, list): raise http_err(r, "MEXC capital/config (check API key)")
         bases = set(pairs.values()); s2p = _sym2pair(pairs); out, seen = [], set()
         for coin in data:
             sym = coin.get("coin")
@@ -621,7 +621,7 @@ class BinanceEx(Exchange):
         k, sec, _ = KEYS["BINANCE"]
         qs, sig = signed_query(sec, {"timestamp": int(time.time() * 1000), "recvWindow": 10000})
         r = http_get(f"{self.BASE}/sapi/v1/capital/config/getall?{qs}&signature={sig}", headers={"X-MBX-APIKEY": k}, limiter=self.lim, timeout=30); d = jget(r)
-        if not isinstance(d, list): raise http_err(r, "Binance capital/config (kiem tra API key / IP)")
+        if not isinstance(d, list): raise http_err(r, "Binance capital/config (check API key / IP)")
         bases = set(pairs.values()); s2p = _sym2pair(pairs); out, seen = [], set()
         for coin in d:
             sym = coin.get("coin")
@@ -920,7 +920,7 @@ class MultiData:
             def load(name):
                 ex = EXCHANGES[name]; t0 = time.time()
                 pairs = ex.load_pairs()
-                if not pairs: raise RuntimeError("0 cap USDT")
+                if not pairs: raise RuntimeError("0 USDT pairs")
                 toks = ex.load_networks(pairs)
                 return name, pairs, toks, time.time() - t0
             with ThreadPoolExecutor(max_workers=len(EXCHANGES)) as pool:
@@ -932,11 +932,11 @@ class MultiData:
                     except Exception as e:
                         h.update(ok=False, err=str(e)[:200]); h["fail_since"] = h["fail_since"] or time.time()
                         log.error("Lam moi %s loi: %s", n, e)
-                        if time.time() - h["fail_since"] > 1800: error_alert(f"cex:{n}", f"<b>{n}</b> loi lien tuc >30 phut: {esc(h['err'])}")
+                        if time.time() - h["fail_since"] > 1800: error_alert(f"cex:{n}", f"<b>{n}</b> failing for >30 min: {esc(h['err'])}")
                         continue
                     verified = toks is not None
                     if toks is None: toks = []
-                    h.update(ok=True, err="" if verified else "khong co du lieu mang (thieu API key?)", pairs=len(pairs), listings=len(toks), verified=verified, fail_since=None)
+                    h.update(ok=True, err="" if verified else "no network/deposit-withdraw data (missing API key?)", pairs=len(pairs), listings=len(toks), verified=verified, fail_since=None)
                     events += self._diff_status(n, toks)
                     with self.lock: self.tokens[n] = toks; self.tok_ts[n] = time.time()
                     log.info("%s: %d cap, %d token-mang (%.1fs)%s", n, len(pairs), len(toks), dt, "" if verified else " [KHONG CO DU LIEU MANG]")
@@ -1127,7 +1127,7 @@ def evm_quote(ch, tin_is_usd, token, dec, amount):
             if q: cands.append({"out": q["out"] / 10**(dec if tin_is_usd else sd), "impact": q["impact"], "gas_usd": q["gas_usd"], "src": "ParaSwap"})
         if cands:
             best = max(cands, key=lambda x: x["out"])
-            if len(cands) > 1: best = dict(best, src=f"{best['src']} (tốt hơn {min(cands, key=lambda x: x['out'])['src']})" if cands[0]["out"] != cands[1]["out"] else best["src"])
+            if len(cands) > 1: best = dict(best, src=f"{best['src']}, best of 2")
             return best, "ok"
         return None, ("error" if all(k == "error" for k in kinds) else "noroute")
     px = native_price(ch, token)
@@ -1197,10 +1197,10 @@ def dex_sell(ch, token, dec, tokens):
 
 # ============================ TAX & BAO MAT ============================
 SEC_CACHE = {}; SEC_LOCK = threading.Lock()
-GP_HARD = {"is_honeypot": "honeypot", "cannot_sell_all": "khong ban het duoc", "owner_change_balance": "owner sua so du", "cannot_buy": "khong mua duoc"}
-GP_SOFT = {"transfer_pausable": "co the tam dung chuyen", "is_blacklisted": "co blacklist", "slippage_modifiable": "owner sua duoc tax",
-           "hidden_owner": "owner an", "trading_cooldown": "cooldown giao dich", "can_take_back_ownership": "lay lai owner", "is_mintable": "mint them duoc",
-           "personal_slippage_modifiable": "tax rieng tung vi", "external_call": "goi contract ngoai"}
+GP_HARD = {"is_honeypot": "honeypot", "cannot_sell_all": "cannot sell all", "owner_change_balance": "owner can change balances", "cannot_buy": "cannot buy"}
+GP_SOFT = {"transfer_pausable": "transfers pausable", "is_blacklisted": "has blacklist", "slippage_modifiable": "owner can change tax",
+           "hidden_owner": "hidden owner", "trading_cooldown": "trading cooldown", "can_take_back_ownership": "can reclaim ownership", "is_mintable": "mintable",
+           "personal_slippage_modifiable": "per-wallet tax", "external_call": "external calls"}
 def _pct(v):
     v = fnum_or_none(v)
     if v is None: return None
@@ -1212,7 +1212,7 @@ def _honeypot(chain_id, token):
     if not ok: return None
     j = jget(r, default={}) or {}
     if not j.get("simulationSuccess"):
-        return {"bad": "honeypot.is khong mo phong duoc mua/ban"} if (j.get("honeypotResult") or {}).get("isHoneypot") else None
+        return {"bad": "honeypot.is: buy/sell simulation failed"} if (j.get("honeypotResult") or {}).get("isHoneypot") else None
     sim = j.get("simulationResult") or {}
     bad = "honeypot" if (j.get("honeypotResult") or {}).get("isHoneypot") else None
     return {"buy": _pct(sim.get("buyTax")) or 0.0, "sell": _pct(sim.get("sellTax")) or 0.0, "transfer": _pct(sim.get("transferTax")) or 0.0, "bad": bad}
@@ -1226,7 +1226,7 @@ def _goplus(chain_id, token):
     bad = next((n for k, n in GP_HARD.items() if str(d.get(k)) == "1"), None)
     soft = [n for k, n in GP_SOFT.items() if str(d.get(k)) == "1"]
     bt, stx, tt = _pct(d.get("buy_tax")), _pct(d.get("sell_tax")), _pct(d.get("transfer_tax"))
-    if str(d.get("is_open_source")) == "0": soft.append("contract khong verify")
+    if str(d.get("is_open_source")) == "0": soft.append("contract not verified")
     return {"buy": bt, "sell": stx, "transfer": tt, "bad": bad, "soft": soft, "known": bt is not None and stx is not None}
 def _sol_sec(token):
     j = rpc_post(SOL_RPC, {"jsonrpc": "2.0", "id": 1, "method": "getAccountInfo", "params": [token, {"encoding": "jsonParsed"}]})
@@ -1235,8 +1235,8 @@ def _sol_sec(token):
     info = (data.get("parsed") or {}).get("info") or {}
     if not info: return None
     soft, bad, fee = [], None, 0.0
-    if info.get("freezeAuthority"): soft.append("con freeze authority")
-    if info.get("mintAuthority"): soft.append("con mint authority")
+    if info.get("freezeAuthority"): soft.append("freeze authority active")
+    if info.get("mintAuthority"): soft.append("mint authority active")
     for ext in info.get("extensions") or []:
         e = ext.get("extension"); st = ext.get("state") or {}
         if e == "transferFeeConfig":
@@ -1244,7 +1244,7 @@ def _sol_sec(token):
             fee = max(fee, fnum(nf.get("transferFeeBasisPoints", of.get("transferFeeBasisPoints", 0))) / 10000.0)
         elif e in ("permanentDelegate", "nonTransferable"): bad = e
         elif e == "transferHook": soft.append("transfer hook")
-        elif e == "pausableConfig": soft.append("co the tam dung")
+        elif e == "pausableConfig": soft.append("pausable")
     return {"buy": fee, "sell": fee, "transfer": fee, "bad": bad, "soft": soft, "known": True, "src": "Solana RPC"}
 def get_security(ch, token):
     key = (ch, norm_addr(ch, token))
@@ -1252,13 +1252,13 @@ def get_security(ch, token):
         c = SEC_CACHE.get(key)
         if c and time.time() - c[0] < (3600 if c[1]["known"] else 600): return c[1]
     cfg = CHAINS[ch]
-    sec = {"known": False, "buy": 0.0, "sell": 0.0, "transfer": 0.0, "bad": None, "soft": [], "src": "khong co nguon"}
+    sec = {"known": False, "buy": 0.0, "sell": 0.0, "transfer": 0.0, "bad": None, "soft": [], "src": "no source"}
     try:
         if cfg["kind"] == "sol":
             s = _sol_sec(token); API.report("sol-rpc", s is not None)
             if s: sec = s
         elif cfg["kind"] == "near":
-            sec = {"known": True, "buy": 0.0, "sell": 0.0, "transfer": 0.0, "bad": None, "soft": [], "src": "NEP-141 (khong co co che tax)"}
+            sec = {"known": True, "buy": 0.0, "sell": 0.0, "transfer": 0.0, "bad": None, "soft": [], "src": "NEP-141 (no tax mechanism)"}
         else:
             cid = cfg["chain_id"]; srcs = []; buy = sell = tr = None; bad = None; soft = []
             if cid in HONEYPOT_CHAINS:
@@ -1275,7 +1275,7 @@ def get_security(ch, token):
                         if g["transfer"] is not None: tr = max(tr or 0.0, g["transfer"])
             has_source = cid in HONEYPOT_CHAINS or cid in GOPLUS_CHAINS
             sec = {"known": buy is not None and sell is not None, "buy": buy or 0.0, "sell": sell or 0.0, "transfer": tr or 0.0,
-                   "bad": bad, "soft": soft, "src": "+".join(srcs) or "khong co nguon", "nosource": not has_source}
+                   "bad": bad, "soft": soft, "src": "+".join(srcs) or "no source", "nosource": not has_source}
     except Exception as e: log.warning("Security loi %s %s: %s", ch, token[:10], e)
     with SEC_LOCK:
         SEC_CACHE[key] = (time.time(), sec)
@@ -1297,18 +1297,18 @@ class Diag:
 def cex_to_dex(ch, tok, pool, depth, sec, dec, usd, mult, fee_cex):
     """Mua usd tren CEX -> rut ve vi -> ban tren DEX."""
     w = walk_usd(depth["asks"], usd)
-    if not w: return None, "so lenh ban CEX khong du"
+    if not w: return None, "CEX ask book too thin"
     avg, tokens = w
     slip = (avg / depth["asks"][0][0] - 1) * 100
-    if slip > MAX_CEX_SLIP_PCT: return None, f"truot gia CEX {slip:.1f}%"
+    if slip > MAX_CEX_SLIP_PCT: return None, f"CEX slippage {slip:.1f}%"
     t_after_fee = tokens * (1 - fee_cex)
     wfee = tok["withdraw_fee"] * mult
-    if t_after_fee < tok["withdraw_min"] * mult: return None, "duoi muc rut toi thieu"
+    if t_after_fee < tok["withdraw_min"] * mult: return None, "below minimum withdrawal"
     _, sell_tax, tr_tax, assumed = effective_tax(sec)
     t_received = (t_after_fee - wfee) * (1 - tr_tax)
-    if t_received <= 0: return None, "phi rut lon hon so token"
+    if t_received <= 0: return None, "withdraw fee exceeds token amount"
     q, kind = dex_sell(ch, tok["contract"], dec, t_received)
-    if not q: return None, f"quote ban DEX: {kind}"
+    if not q: return None, f"DEX sell quote: {kind}"
     gas = q["gas_usd"] if q.get("gas_usd") else CHAINS[ch]["gas_usd"]
     usd_out = q["out"] * (1 - sell_tax) * (1 - EXTRA_SLIPPAGE)
     net = usd_out - gas - usd
@@ -1321,13 +1321,13 @@ def dex_to_cex(ch, tok, pool, depth, sec, dec, usd, mult, fee_cex):
     """Mua usd tren DEX -> nap len CEX -> ban vao so lenh mua CEX."""
     buy_tax, _, tr_tax, assumed = effective_tax(sec)
     q, kind = dex_buy(ch, tok["contract"], dec, usd)
-    if not q: return None, f"quote mua DEX: {kind}"
+    if not q: return None, f"DEX buy quote: {kind}"
     t_after_buy = q["out"] * (1 - buy_tax) * (1 - EXTRA_SLIPPAGE)
     t_deposit = t_after_buy * (1 - tr_tax)
     proceeds = walk_tokens(depth["bids"], t_deposit)
-    if not proceeds: return None, "so lenh mua CEX khong hap thu het"
+    if not proceeds: return None, "CEX bid book cannot absorb all tokens"
     avg = proceeds / t_deposit; slip = (1 - avg / depth["bids"][0][0]) * 100
-    if slip > MAX_CEX_SLIP_PCT: return None, f"truot gia CEX {slip:.1f}%"
+    if slip > MAX_CEX_SLIP_PCT: return None, f"CEX slippage {slip:.1f}%"
     gas_buy = q["gas_usd"] if q.get("gas_usd") else CHAINS[ch]["gas_usd"]
     gas = gas_buy + CHAINS[ch]["gas_usd"]          # gas swap + gas chuyen len san
     revenue = proceeds * (1 - fee_cex); cost = usd + gas; net = revenue - cost
@@ -1350,7 +1350,7 @@ def best_size(fn, direction, ch, tok, pool, depth, sec, dec, mult, fee_cex, diag
         return r, [(fixed, r["net_pct"] if r else None)], why
     cap, cap_dex, cap_cex = size_cap(pool, depth, direction)
     if cap < ORDER_SIZE_MIN:
-        diag.add(f"{direction}: size toi da ${cap:.0f} < ${ORDER_SIZE_MIN:.0f} (DEX cho ${cap_dex:.0f}, so lenh CEX cho ${cap_cex:.0f})")
+        diag.add(f"{direction}: max size ${cap:.0f} < ${ORDER_SIZE_MIN:.0f} (DEX allows ${cap_dex:.0f}, CEX book allows ${cap_cex:.0f})")
         return None, [], "thin"
     steps = sorted({s for s in SIZE_STEPS if ORDER_SIZE_MIN <= s <= cap} | ({math.floor(cap / 10) * 10} if cap < ORDER_SIZE_MAX else set()))
     tried, res, last_why, falling = [], {}, "", 0
@@ -1367,7 +1367,7 @@ def best_size(fn, direction, ch, tok, pool, depth, sec, dec, mult, fee_cex, diag
     ok = [r for r in res.values() if r and r["net_pct"] >= MIN_NET_PCT and r["net_usd"] >= MIN_NET_USD]
     if not ok:
         top = max((r for r in res.values() if r), key=lambda x: x["net_pct"], default=None)
-        return None, tried, (f"lai tot nhat {top['net_pct']:.2f}% (${top['net_usd']:.2f}) < nguong" if top else last_why)
+        return None, tried, (f"best profit {top['net_pct']:.2f}% (${top['net_usd']:.2f}) < threshold" if top else last_why)
     best = max(ok, key=(lambda x: (x["net_pct"], x["net_usd"])) if SIZE_MODE == "pct" else (lambda x: x["net_usd"]))
     return best, tried, "ok"
 
@@ -1381,19 +1381,19 @@ def evaluate(ch, tok, pool, depth, diag=None, fixed=None, only_dir=None):
     dev = abs(mid - pool["price"]) / pool["price"]
     lim_dev = MAX_PRICE_DEV_INFERRED if tok.get("inferred") else MAX_PRICE_DEV
     if dev > lim_dev:
-        st.inc("contract_skip"); diag.add(f"gia CEX lech DEX {dev*100:.0f}% > {lim_dev*100:.0f}% -> nghi khac token / san doi ty le"); return []
+        st.inc("contract_skip"); diag.add(f"CEX price deviates {dev*100:.0f}% from DEX > {lim_dev*100:.0f}% -> likely different token / redenomination"); return []
     sec = get_security(ch, tok["contract"])
-    if sec["bad"]: st.inc("tax_skip"); diag.add(f"bao mat: {sec['bad']}"); return []
-    if max(sec["buy"], sec["sell"], sec["transfer"]) > TAX_MAX: st.inc("tax_skip"); diag.add(f"tax qua cao (mua {sec['buy']*100:.1f}% / ban {sec['sell']*100:.1f}% / chuyen {sec['transfer']*100:.1f}%)"); return []
-    if not sec["known"] and not sec.get("nosource") and UNKNOWN_TAX_MODE == "skip": st.inc("tax_skip"); diag.add("khong xac minh duoc tax (UNKNOWN_TAX_MODE=skip)"); return []
+    if sec["bad"]: st.inc("tax_skip"); diag.add(f"security: {sec['bad']}"); return []
+    if max(sec["buy"], sec["sell"], sec["transfer"]) > TAX_MAX: st.inc("tax_skip"); diag.add(f"tax too high (buy {sec['buy']*100:.1f}% / sell {sec['sell']*100:.1f}% / transfer {sec['transfer']*100:.1f}%)"); return []
+    if not sec["known"] and not sec.get("nosource") and UNKNOWN_TAX_MODE == "skip": st.inc("tax_skip"); diag.add("tax could not be verified (UNKNOWN_TAX_MODE=skip)"); return []
     dec = get_decimals(ch, tok["contract"])
-    if dec is None: st.inc("quote_fail"); diag.add("khong doc duoc decimals (kiem tra RPC)"); return []
+    if dec is None: st.inc("quote_fail"); diag.add("cannot read decimals (check RPC)"); return []
     fee_cex = ex.taker_fee(tok["cex_pair"]); out = []
     plans = []
     if status_ok(tok.get("withdraw_enable")) and tok.get("withdraw_fee") is not None: plans.append(("CEX_TO_DEX", cex_to_dex))
-    else: diag.add(f"CEX→DEX: rut {status_icon(tok.get('withdraw_enable'))}, phi rut {'?' if tok.get('withdraw_fee') is None else tok['withdraw_fee']}")
+    else: diag.add(f"CEX→DEX: withdraw {status_icon(tok.get('withdraw_enable'))}, withdraw fee {'?' if tok.get('withdraw_fee') is None else tok['withdraw_fee']}")
     if status_ok(tok.get("deposit_enable")): plans.append(("DEX_TO_CEX", dex_to_cex))
-    else: diag.add(f"DEX→CEX: nap {status_icon(tok.get('deposit_enable'))}")
+    else: diag.add(f"DEX→CEX: deposit {status_icon(tok.get('deposit_enable'))}")
     for direction, fn in plans:
         if only_dir and direction != only_dir: continue
         st.inc("evaluated")
@@ -1405,7 +1405,7 @@ def evaluate(ch, tok, pool, depth, diag=None, fixed=None, only_dir=None):
             continue
         imp = r["impact"]
         if imp is not None and imp > MAX_IMPACT_PCT: diag.add(f"{direction}: impact DEX {imp:.2f}% > {MAX_IMPACT_PCT}%"); continue
-        if abs(r["dex_price"] - pool["price"]) / pool["price"] > 0.25: st.inc("suspect"); diag.add(f"{direction}: gia quote lech gia pool >25% -> bo"); continue
+        if abs(r["dex_price"] - pool["price"]) / pool["price"] > 0.25: st.inc("suspect"); diag.add(f"{direction}: quote price deviates >25% from pool -> skipped"); continue
         r.update(cex=tok["cex"], mult=mult, cex_fee=fee_cex, cex_bid=bid, cex_ask=ask, spread=spread, sec=sec, tried=tried, checked_at=time.time(),
                  withdraw_enable=tok.get("withdraw_enable"), deposit_enable=tok.get("deposit_enable"), inferred=tok.get("inferred", False))
         out.append(r)
@@ -1467,60 +1467,82 @@ def spread_age(key):
         if not v or now - v[1] > 900: FIRST_SEEN[key] = [now, now]; return 0.0
         v[1] = now; return (now - v[0]) / 60
 
+def fmt_k(v):
+    v = fnum(v)
+    if v >= 1e6: return f"${v/1e6:.2f}M"
+    if v >= 1e3: return f"${v/1e3:.0f}K"
+    return f"${v:.0f}"
+def px8(v):
+    v = fnum(v)
+    if v >= 1: return f"{v:,.4f}"
+    if v >= 0.0001: return f"{v:.8f}"
+    return f"{v:.12f}"
 def build_alert(ch, tok, pool, p, tag=""):
     cfg = CHAINS[ch]; ex = EXCHANGES[tok["cex"]]; sym = tok["symbol"]; cex = tok["cex"]; sec = p["sec"]
     cex_url = ex.trade_url(tok["cex_pair"]); buy_url, sell_url = swap_urls(ch, tok["contract"])
-    usd = p["usd_size"]; net_line = f"💰 <b>Lãi ròng {p['net_pct']:+.2f}% ({fmt_usd(p['net_usd'])})</b> · vốn {fmt_usd(usd)}"
+    pair = esc(tok["cex_pair"]); c2d = p["direction"] == "CEX_TO_DEX"
+    usd = p["usd_size"]; tm = cfg["transfer_min"] + CEX_EXTRA_MIN.get(cex, 5)
+    tax_total = (p["sell_tax"] if c2d else p["buy_tax"]) + p["transfer_tax"]
+    after_tax = p["gross_pct"] - tax_total * 100
     imp = f"{p['impact']:.2f}%" if p.get("impact") is not None else "n/a"
-    if p["direction"] == "CEX_TO_DEX":
-        title = f"{cex} → DEX"
-        steps = (f"1️⃣ Mua trên <a href=\"{esc_url(cex_url)}\">{cex}</a>: {fmt_usd(usd)} → <b>{fmt_tok(p['tokens_cex'])} {esc(sym)}</b> · giá TB {fmt_price(p['cex_avg'])} (trượt {p['cex_slip']:.2f}%, phí {p['cex_fee']*100:.2f}%)\n"
-                 f"2️⃣ Rút về <b>{cfg['name']}</b> ({esc(tok['raw_network'])}): phí rút {fmt_tok(p['withdraw_fee_tok'])} (~{fmt_usd(p['withdraw_fee_usd'])})"
-                 + (f", tax chuyển {pct(p['transfer_tax'])}" if p["transfer_tax"] else "") + f" → nhận <b>{fmt_tok(p['tokens_received'])}</b>\n"
-                 f"3️⃣ <a href=\"{esc_url(sell_url)}\">Bán trên DEX</a> ({p['quote_src']}): ≈ {fmt_usd(p['dex_quote_usd'])} · giá {fmt_price(p['dex_price'])}, impact {imp}"
-                 + (f"\n    − tax bán {pct(p['sell_tax'])}" if p["sell_tax"] else "") + f" − dự phòng trượt {EXTRA_SLIPPAGE*100:.1f}% − gas {fmt_usd(p['gas'])} → <b>{fmt_usd(p['usd_out'] - p['gas'])}</b>")
+    hr = "────────────────────────"
+    # --- tax ---
+    if sec["known"]:
+        tax = "0%" if max(sec["buy"], sec["sell"], sec["transfer"]) == 0 else f"buy {pct(sec['buy'])} / sell {pct(sec['sell'])} / transfer {pct(sec['transfer'])}"
+    elif sec.get("nosource"): tax = f"{pct(NO_SOURCE_TAX)} (default, no tax source)"
+    else: tax = f"assumed {pct(UNKNOWN_TAX_ASSUME)}/{pct(UNKNOWN_TAX_ASSUME)}"
+    # --- route ---
+    if c2d:
+        route = f"📤 <a href=\"{esc_url(cex_url)}\">BUY {pair}</a> → WITHDRAW {esc(cfg['name'])} → <a href=\"{esc_url(sell_url)}\">SELL DEX</a>"
+        amount = p["tokens_received"]; wfee_usd = p["withdraw_fee_usd"]
     else:
-        title = f"DEX → {cex}"
-        steps = (f"1️⃣ <a href=\"{esc_url(buy_url)}\">Mua trên DEX</a> ({p['quote_src']}): {fmt_usd(usd)} → <b>{fmt_tok(p['tokens_dex'])} {esc(sym)}</b> · giá {fmt_price(p['dex_price'])}, impact {imp}"
-                 + (f"\n    − tax mua {pct(p['buy_tax'])}" if p["buy_tax"] else "") + f" − dự phòng trượt {EXTRA_SLIPPAGE*100:.1f}% → {fmt_tok(p['tokens_after_buy'])}\n"
-                 f"2️⃣ Nạp lên <a href=\"{esc_url(cex_url)}\">{cex}</a> qua <b>{cfg['name']}</b> ({esc(tok['raw_network'])})"
-                 + (f", tax chuyển {pct(p['transfer_tax'])}" if p["transfer_tax"] else "") + f" → <b>{fmt_tok(p['tokens_deposit'])}</b> · gas tổng ~{fmt_usd(p['gas'])}\n"
-                 f"3️⃣ Bán trên {cex}: sổ lệnh hấp thụ hết, giá TB {fmt_price(p['cex_avg'])} (trượt {p['cex_slip']:.2f}%, phí {p['cex_fee']*100:.2f}%) → <b>{fmt_usd(p['revenue'])}</b>")
-    tax_src = sec.get("src", "")
-    if sec["known"]: tax_txt = f"mua {pct(sec['buy'])} / bán {pct(sec['sell'])} / chuyển {pct(sec['transfer'])} ({esc(tax_src)})"
-    elif sec.get("nosource"): tax_txt = f"mặc định {pct(NO_SOURCE_TAX)} (mạng {cfg['name']} chưa có nguồn kiểm tra tax)"
-    else: tax_txt = f"tra cứu thất bại → đã giả định mua {pct(UNKNOWN_TAX_ASSUME)} + bán {pct(UNKNOWN_TAX_ASSUME)}"
-    checks = [
-        ("✅ Contract khớp (" + cex + " công bố = pool DEX)") if not tok.get("inferred") else ("⚠ Contract SUY RA theo symbol (" + cex + " không công bố) - tự kiểm tra lại"),
-        f"{status_icon(p['deposit_enable'])} Nạp {cex}  {status_icon(p['withdraw_enable'])} Rút {cex}",
-        ("✅" if sec["known"] else "ℹ️" if sec.get("nosource") else "⚠") + " Tax: " + tax_txt,
-        "✅ Không phát hiện honeypot" if not sec.get("bad") else f"❌ {esc(sec['bad'])}",
-    ]
+        route = f"📥 <a href=\"{esc_url(buy_url)}\">BUY DEX</a> → DEPOSIT {cex} → <a href=\"{esc_url(cex_url)}\">SELL {pair}</a>"
+        amount = p["tokens_deposit"]; wfee_usd = 0.0
+    # --- canh bao ---
     warn = []
-    if sec.get("soft"): warn.append("Contract: " + ", ".join(sec["soft"]))
-    if p["gross_pct"] > WARN_GROSS: warn.append(f"chênh lệch {p['gross_pct']:.1f}% lớn bất thường - thường do nạp/rút thực tế bị treo, kiểm tra trên app sàn trước")
-    age = p.get("age_min", 0)
-    if age >= 30: warn.append(f"kèo đã tồn tại {age:.0f} phút - có thể sàn đang treo nạp/rút thực tế")
-    if pool["age_h"] < 48: warn.append(f"pool mới {pool['age_h']:.0f}h")
-    if abs(pool["chg_m5"]) >= 5: warn.append(f"biến động mạnh 5m {pool['chg_m5']:+.1f}%")
-    if p["mult"] != 1: warn.append(f"{cex} niêm yết theo đơn vị x{p['mult']:.0f} - đã quy đổi")
+    if tok.get("inferred"): warn.append(f"contract inferred by symbol ({cex} does not publish contract) - verify!")
+    if not sec["known"] and not sec.get("nosource"): warn.append("no security data")
+    if sec.get("bad"): warn.append(sec["bad"])
+    if sec.get("soft"): warn.append(", ".join(sec["soft"]))
+    if p["gross_pct"] > WARN_GROSS: warn.append(f"gross {p['gross_pct']:.1f}% unusually high - check deposit/withdraw on {cex} app")
+    if p.get("age_min", 0) >= 30: warn.append(f"spread alive {p['age_min']:.0f} min - deposit/withdraw may be stuck")
+    if pool["age_h"] < 48: warn.append(f"new pool {pool['age_h']:.0f}h")
+    if abs(pool["chg_m5"]) >= 5: warn.append(f"volatile 5m {pool['chg_m5']:+.1f}%")
+    if p["mult"] != 1: warn.append(f"{cex} lists x{p['mult']:.0f} units - converted")
     fut = MULTI.futures_for(sym)
-    hedge = (f"🛡 Hedge được: có Futures USDT trên {', '.join(fut)}" + (" → short futures ngay khi mua DEX để khoá lời trong lúc chờ nạp" if p["direction"] == "DEX_TO_CEX" else "")) if fut else "🛡 Không có futures để hedge"
-    tried = " · ".join(f"${s:.0f}:{x:+.1f}%" for s, x in sorted(p.get("tried", [])) if x is not None)
-    tm = cfg["transfer_min"] + CEX_EXTRA_MIN.get(cex, 5)
-    msg = (f"{cfg['emoji']} <b>{esc(sym)} [{cfg['name']}] {title}</b>{(' | ' + tag) if tag else ''}\n{net_line}\n"
-           f"📊 Chênh lệch giá {p['gross_pct']:+.2f}% · size tối ưu {fmt_usd(usd)} ({'% lãi cao nhất' if SIZE_MODE == 'pct' else '$ lãi cao nhất'})" + (f" (đã thử {tried})" if tried else "") + "\n"
-           f"━━━━━━━━━━━━━━\n{steps}\n━━━━━━━━━━━━━━\n🔎 " + "\n🔎 ".join(checks) + "\n"
-           f"🏦 {cex} {esc(tok['cex_pair'])}: bid {fmt_price(p['cex_bid'])} / ask {fmt_price(p['cex_ask'])} (spread {p['spread']:.2f}%)\n"
-           f"🦄 DEX ({len(pool.get('dexes', []))} sàn, {pool.get('n_pools', 1)} pool): giá TB {fmt_price(pool['price'])} · tổng liq {fmt_usd(pool['liq_total'])} · vol24h {fmt_usd(pool['vol24'])} · tx1h {pool['txns_h1']} · biến động 5m {pool['chg_m5']:+.1f}% / 1h {pool['chg_h1']:+.1f}%\n"
-           + "".join(f"    • {esc(x['dex'])}: {fmt_price(x['price'])} · liq {fmt_usd(x['liq'])} · vol {fmt_usd(x['vol24'])}\n" for x in pool.get("dexes", [])[:5]) +
-           f"    → Quote thật qua aggregator ({esc(p['quote_src'])}), tự định tuyến qua tất cả DEX để lấy giá tốt nhất\n"
-           f"{hedge}\n" + ("".join(f"⚠ {esc(w)}\n" for w in warn)) +
-           f"📜 <code>{esc(tok['contract'])}</code>\n"
-           f"🔗 <a href=\"{esc_url(cex_url)}\">{cex}</a> | <a href=\"{esc_url(buy_url)}\">DEX mua</a> | <a href=\"{esc_url(sell_url)}\">DEX bán</a> | <a href=\"{esc_url(pool['url'])}\">Chart</a> | <a href=\"{esc_url(cfg['explorer'] + tok['contract'])}\">Explorer</a>\n"
-           f"⏱ Chuyển token ~{tm:.0f} phút · đã xác nhận lại sau {CONFIRM_DELAY:.0f}s · {datetime.now(VN_TZ).strftime('%H:%M:%S %d/%m')}\n"
-           f"<i>Chỉ là cảnh báo, giá có thể đổi trong lúc chuyển. Tự kiểm tra trước khi vào lệnh.</i>")
-    return msg
+    dexes = pool.get("dexes") or []
+    others = " · ".join(f"{esc(x['dex'])} {fmt_k(x['liq'])}" for x in dexes[:4])
+    lines = [
+        f"<b>{esc(sym)} [{ch}] {'%s_TO_DEX' % cex if c2d else 'DEX_TO_%s' % cex}</b> | {esc(tag) if tag else 'confirmed'} | {cfg['emoji']}",
+        hr,
+        f"💰 <b>PROFIT {p['net_pct']:.2f}% ({fmt_usd(p['net_usd'])})</b> after all fees | Gross {p['gross_pct']:.2f}%",
+        f"📈 Gross {p['gross_pct']:.2f}% → After tax {after_tax:.2f}% | Impact {imp}",
+        f"🛡️ Buffer {EXTRA_SLIPPAGE*100:.2f}% | Threshold {MIN_NET_PCT:.2f}%",
+        hr,
+        route,
+        hr,
+        f"💸 Tax: {tax} | 🏦 Deposit: {status_icon(p['deposit_enable'])} | Withdraw: {status_icon(p['withdraw_enable'])}",
+        f"💵 Capital ${usd:,.0f} | Amount {fnum(amount):,.0f}",
+        f"⛽️ Gas ${p['gas']:.2f} | Withdraw Fee ${wfee_usd:.2f} | {cex} Fee {p['cex_fee']*100:.2f}%",
+        hr,
+        f"🏦 {cex} {pair}",
+        f"Bid {px8(p['cex_bid'])} / Ask {px8(p['cex_ask'])} → Avg ${px8(p['cex_avg'])}",
+        f"🦄 {esc(pool['dex'])} {esc(pool['pair_name'])}" + (f" (+{len(dexes)-1} DEX)" if len(dexes) > 1 else ""),
+        f"DS ${px8(pool['price'])} → Exec ${px8(p['dex_price'])} ({esc(p['quote_src'])})",
+        f"💧 {fmt_usd(pool['liq_total'])} | Vol {fmt_usd(pool['vol24'])} | Tx1h {pool['txns_h1']} | Age {pool['age_h']:.0f}h",
+        f"Change 5m {pool['chg_m5']:+.1f}% | 1h {pool['chg_h1']:+.1f}%",
+    ]
+    if len(dexes) > 1: lines.append(f"DEX: {others}")
+    if fut: lines.append(f"🔁 Hedge: futures on {', '.join(fut)}")
+    lines.append(hr)
+    lines += [f"⚠️ {esc(w)}" for w in warn]
+    lines += [
+        f"📜 Contract: <code>{esc(tok['contract'])}</code>",
+        f"🔗 <a href=\"{esc_url(cex_url)}\">{cex} Trade</a> | <a href=\"{esc_url(buy_url)}\">DEX Buy</a> | <a href=\"{esc_url(sell_url)}\">DEX Sell</a> | "
+        f"<a href=\"{esc_url(pool['url'])}\">Info</a> | <a href=\"{esc_url(cfg['explorer'] + tok['contract'])}\">Explorer</a>",
+        f"⏰ {datetime.now(VN_TZ).strftime('%H:%M %d/%m')} | Transfer ~{tm:.0f} min | Price changes fast!",
+    ]
+    return "\n".join(lines)
 
 # ============================ DATABASE ============================
 class DB_:
@@ -1588,7 +1610,7 @@ def check_candidate(ch, tok, pool, diag=None):
     try:
         depth = EXCHANGES[tok["cex"]].depth(tok["cex_pair"])
         if not depth:
-            if diag: diag.add("khong lay duoc so lenh CEX")
+            if diag: diag.add("cannot fetch CEX order book")
             return []
         return [(tok, pool, p) for p in evaluate(ch, tok, pool, depth, diag)]
     except Exception:
@@ -1659,21 +1681,32 @@ class Worker:
         self.start()
 
 # ============================ SU KIEN NAP / RUT ============================
-KIND_TXT = {"open_withdraw": "🔓 MỞ RÚT", "open_deposit": "🔓 MỞ NẠP", "close_withdraw": "🔒 ĐÓNG RÚT", "close_deposit": "🔒 ĐÓNG NẠP"}
+KIND_TXT = {"open_withdraw": "🔓 WITHDRAW OPEN", "open_deposit": "🔓 DEPOSIT OPEN", "close_withdraw": "🔒 WITHDRAW CLOSED", "close_deposit": "🔒 DEPOSIT CLOSED"}
 PRIO = ThreadPoolExecutor(max_workers=2, thread_name_prefix="PRIO")
+def status_title(cex, kinds):
+    opened = {k.split("_")[1] for k in kinds if k.startswith("open")}
+    closed = {k.split("_")[1] for k in kinds if k.startswith("close")}
+    name = lambda s: "Deposits & Withdrawals" if s == {"deposit", "withdraw"} else ("Deposits" if "deposit" in s else "Withdrawals")
+    if opened and not closed: return f"🔓 {cex} {name(opened)} Reopened"
+    if closed and not opened: return f"🔒 {cex} {name(closed)} Suspended"
+    return f"🔄 {cex} Deposit/Withdrawal Status Changed"
 def handle_status_events(events):
     for cex, tok, kind in events: DB.q("INSERT INTO status_events(ts,cex,chain,symbol,kind) VALUES(?,?,?,?,?)", (time.time(), cex, tok["chain"], tok["symbol"], kind), commit=True)
-    if not STATUS_NOTIFY: return
-    by_cex = {}
-    for cex, tok, kind in events: by_cex.setdefault(cex, []).append((tok, kind))
-    for cex, lst in by_cex.items():
-        lst.sort(key=lambda x: (not x[1].startswith("open"), x[0]["symbol"]))
-        lines = [f"🔔 <b>{cex}: thay đổi nạp/rút ({len(lst)})</b>"]
-        for tok, kind in lst[:STATUS_MAX_LINES]:
-            lines.append(f"{KIND_TXT[kind]} <b>{esc(tok['symbol'])}</b> · {CHAINS[tok['chain']]['name']} ({esc(tok['raw_network'])})")
-        if len(lst) > STATUS_MAX_LINES: lines.append(f"... và {len(lst) - STATUS_MAX_LINES} thay đổi khác")
-        lines.append("<i>Token vừa MỞ sẽ được kiểm tra chênh lệch ngay.</i>")
-        send_telegram("\n".join(lines))
+    if STATUS_NOTIFY:
+        groups = {}
+        for cex, tok, kind in events:
+            g = groups.setdefault((cex, tok["chain"], tok["key"] or tok["symbol"], tok["symbol"]), {"tok": tok, "kinds": []})
+            g["kinds"].append(kind)
+        items = sorted(groups.items(), key=lambda kv: (not any(k.startswith("open") for k in kv[1]["kinds"]), kv[0][0], kv[0][3]))
+        for (cex, ch, _, sym), g in items[:STATUS_MAX_LINES]:
+            tok = g["tok"]; contract = tok["contract"] or (MULTI.resolve(tok) or {}).get("contract", "")
+            ct = f"<code>{esc(contract)}</code>" + (" (inferred)" if contract and not tok["contract"] else "") if contract else "not published by exchange"
+            send_telegram(f"<b>{status_title(cex, g['kinds'])}</b>\n\n"
+                          f"<b>{esc(sym)}</b> [{ch}] — Deposit {status_icon(tok['deposit_enable'])} | Withdrawal {status_icon(tok['withdraw_enable'])}\n\n"
+                          f"Contract: {ct}")
+        if len(items) > STATUS_MAX_LINES:
+            by_cex = Counter(k[0] for k, _ in items[STATUS_MAX_LINES:])
+            send_telegram("ℹ️ ... and " + ", ".join(f"{n} more changes on {c}" for c, n in by_cex.items()))
     for cex, tok, kind in events:
         if kind.startswith("open"): PRIO.submit(check_opened, cex, tok, kind)
 def check_opened(cex, tok, kind):
@@ -1683,7 +1716,7 @@ def check_opened(cex, tok, kind):
         pools = fetch_dex_pools(ch, [t["contract"]]); pool = (pools or {}).get(t["key"])
         if not pool or not symbol_ok(t["symbol"], pool["dex_symbol"]): return
         res = check_candidate(ch, t, pool)
-        if res: process(ch, res, tag=f"{KIND_TXT[kind]} trên {cex}")
+        if res: process(ch, res, tag=f"{KIND_TXT[kind]} on {cex}")
     except Exception: log.exception("check_opened loi")
 
 # ============================ THEO DOI KET QUA (PAPER) ============================
@@ -1729,10 +1762,10 @@ def cex_health_lines():
     out = []
     for n in EXCHANGES:
         h = MULTI.health.get(n)
-        if not h: out.append(f"⏳ {n}: chưa tải"); continue
+        if not h: out.append(f"⏳ {n}: not loaded yet"); continue
         if not h["ok"]: out.append(f"❌ {n}: {esc(h['err'])}")
-        elif not h["verified"]: out.append(f"⚠ {n}: {h['pairs']} cặp, KHÔNG có dữ liệu mạng/nạp-rút → {esc(h['err'])}")
-        else: out.append(f"✅ {n}: {h['pairs']} cặp, {h['listings']} token-mạng")
+        elif not h["verified"]: out.append(f"⚠ {n}: {h['pairs']} pairs, NO network/deposit-withdraw data → {esc(h['err'])}")
+        else: out.append(f"✅ {n}: {h['pairs']} pairs, {h['listings']} token-networks")
     return out
 def daily_report():
     now = datetime.now(VN_TZ); since = time.time() - 86400
@@ -1740,19 +1773,19 @@ def daily_report():
     ev = DB.q("SELECT kind, COUNT(*) FROM status_events WHERE ts>? GROUP BY kind", (since,))
     done = [r for r in rows if r[7] in ("ok", "gone")]; wins = [r for r in done if r[7] == "ok" and (r[6] or 0) > 0]
     L = [f"📊 <b>DAILY REPORT {now.strftime('%d/%m/%Y')} · {VERSION}</b>",
-         f"Kèo đã báo 24h: <b>{len(rows)}</b> · tổng lãi dự kiến {fmt_usd(sum(r[5] or 0 for r in rows))}",
-         (f"Kiểm chứng sau {FOLLOWUP_MIN[0]} phút (paper): thắng {len(wins)}/{len(done)} ({len(wins)/len(done)*100:.0f}%)" if done else "Kiểm chứng paper: chưa có dữ liệu")]
+         f"Signals (24h): <b>{len(rows)}</b> · total est. profit {fmt_usd(sum(r[5] or 0 for r in rows))}",
+         (f"Paper check after {FOLLOWUP_MIN[0]} min: won {len(wins)}/{len(done)} ({len(wins)/len(done)*100:.0f}%)" if done else "Paper check: no data yet")]
     if rows:
-        L.append("\n<b>Top kèo:</b>")
+        L.append("\n<b>Top signals:</b>")
         for s, ch, cx, d, npct, nusd, pa, sa in rows[:8]:
             res = f"→ {pa:+.1f}%" if sa == "ok" and pa is not None else (f"→ {sa}" if sa else "")
             L.append(f"• {esc(s)} [{ch}] {'DEX→' + cx if d == 'DEX_TO_CEX' else cx + '→DEX'}: {npct:+.2f}% ({fmt_usd(nusd)}) {res}")
-    L.append("\n<b>Quét theo mạng (24h):</b>")
+    L.append("\n<b>Scan by chain (24h):</b>")
     for k, st in STATS.items():
         s = st.snapshot(daily=True)
-        L.append(f"{CHAINS[k]['emoji']} {k}: pool {s.get('pools',0)} · ứng viên {s.get('candidates',0)} · kèo {s.get('signals',0)} · không xác nhận {s.get('unconfirmed',0)} · loại tax {s.get('tax_skip',0)} · lệch contract/giá {s.get('contract_skip',0)} · mỏng {s.get('thin',0)}")
-    if ev: L.append("\nNạp/rút đổi trạng thái: " + ", ".join(f"{KIND_TXT.get(k, k)} {c}" for k, c in ev))
-    L.append("\n<b>Sàn:</b>"); L += cex_health_lines()
+        L.append(f"{CHAINS[k]['emoji']} {k}: pools {s.get('pools',0)} · candidates {s.get('candidates',0)} · signals {s.get('signals',0)} · unconfirmed {s.get('unconfirmed',0)} · tax skip {s.get('tax_skip',0)} · contract/price mismatch {s.get('contract_skip',0)} · thin {s.get('thin',0)}")
+    if ev: L.append("\nDeposit/withdraw changes: " + ", ".join(f"{KIND_TXT.get(k, k)} {c}" for k, c in ev))
+    L.append("\n<b>Exchanges:</b>"); L += cex_health_lines()
     L.append("\nAPI: " + esc(API.line()))
     send_long("\n".join(L))
     for st in STATS.values(): st.reset_day()
@@ -1767,13 +1800,13 @@ def scheduler_loop():
                 last = now.date(); daily_report()
             for k, st in STATS.items():
                 if st.last_scan and time.time() - st.last_scan > 3600:
-                    error_alert(f"stuck:{k}", f"Mạng {k} không hoàn thành vòng quét nào trong 1 giờ.")
+                    error_alert(f"stuck:{k}", f"Chain {k} has not completed a scan in the last hour.")
         except Exception: log.exception("scheduler loi")
 
 # ============================ LENH TELEGRAM ============================
 def cmd_check(sym):
     """Chan doan: vi sao token khong duoc bao."""
-    s = norm_sym(sym); lines = [f"🔍 <b>KIỂM TRA {esc(sym)}</b>"]; found = False
+    s = norm_sym(sym); lines = [f"🔍 <b>CHECK {esc(sym)}</b>"]; found = False
     for ch in CHAINS:
         for e in MULTI.by_chain.get(ch, []):
             lst = [l for l in e["listings"] if norm_sym(l["symbol"]) == s]
@@ -1782,71 +1815,71 @@ def cmd_check(sym):
             pools = fetch_dex_pools(ch, [e["contract"]]); pool = (pools or {}).get(e["key"])
             lines.append(f"\n{CHAINS[ch]['emoji']} <b>{CHAINS[ch]['name']}</b> <code>{esc(e['contract'])}</code>")
             if not pool:
-                lines.append(f"  ✗ Không có pool đạt lọc (liq ≥ {fmt_usd(MIN_LIQ_USD)}, vol24h ≥ {fmt_usd(MIN_VOL_24H)}, tx1h ≥ {MIN_TXNS_H1}, tuổi ≥ {MIN_POOL_AGE_H:.0f}h)"); continue
-            lines.append(f"  DEX: {len(pool['dexes'])} sàn / {pool['n_pools']} pool · giá TB {fmt_price(pool['price'])} (thấp {fmt_price(pool['price_min'])} - cao {fmt_price(pool['price_max'])}) · liq {fmt_usd(pool['liq_total'])}")
+                lines.append(f"  ✗ No pool passes filters (liq ≥ {fmt_usd(MIN_LIQ_USD)}, vol24h ≥ {fmt_usd(MIN_VOL_24H)}, tx1h ≥ {MIN_TXNS_H1}, age ≥ {MIN_POOL_AGE_H:.0f}h)"); continue
+            lines.append(f"  DEX: {len(pool['dexes'])} DEXs / {pool['n_pools']} pools · avg price {fmt_price(pool['price'])} (low {fmt_price(pool['price_min'])} - high {fmt_price(pool['price_max'])}) · liq {fmt_usd(pool['liq_total'])}")
             lines.append("  " + ", ".join(f"{esc(x['dex'])} {fmt_usd(x['liq'])}" for x in pool["dexes"][:6]))
             for tok in lst:
                 d = Diag(True); res = check_candidate(ch, tok, pool, d)
-                lines.append(f"  • {tok['cex']}{' (contract suy ra)' if tok.get('inferred') else ''}: nạp {status_icon(tok['deposit_enable'])} rút {status_icon(tok['withdraw_enable'])}")
+                lines.append(f"  • {tok['cex']}{' (contract inferred)' if tok.get('inferred') else ''}: deposit {status_icon(tok['deposit_enable'])} withdraw {status_icon(tok['withdraw_enable'])}")
                 lines += [f"     - {esc(x)}" for x in d.lines[:8]]
                 if res:
                     ok_txt = ", ".join("%s %+.2f%%" % (p["direction"], p["net_pct"]) for _, _, p in res)
-                    lines.append(f"     ✅ ĐẠT: {ok_txt}")
+                    lines.append(f"     ✅ PASS: {ok_txt}")
     nocontract = [(n, t) for n, ts in MULTI.tokens.items() for t in ts if norm_sym(t["symbol"]) == s and not t["contract"]]
     for n, t in nocontract[:6]:
-        lines.append(f"• {n} [{t['chain']}]: sàn không công bố contract" + (" và không ghép được (0 hoặc >1 contract cùng symbol)" if not MULTI.resolve(t) else ""))
-    if not found and not nocontract: lines.append("Không thấy token trên các mạng/sàn đang quét (hoặc sàn không có dữ liệu mạng).")
+        lines.append(f"• {n} [{t['chain']}]: exchange does not publish contract" + (" and it cannot be matched (0 or >1 contracts with same symbol)" if not MULTI.resolve(t) else ""))
+    if not found and not nocontract: lines.append("Token not found on scanned chains/exchanges (or exchange has no network data).")
     return "\n".join(lines)
 def handle_command(text):
     parts = text.strip().split(); cmd = parts[0].lower().split("@")[0]; arg = parts[1].upper() if len(parts) > 1 else ""
     if cmd in ("/start", "/help"):
-        return ("<b>Lệnh</b>\n/status - tình trạng bot & sàn\n/check SYMBOL - kiểm tra vì sao token có/không có kèo\n/deposit SYMBOL - nạp/rút theo mạng, theo sàn\n"
-                "/top - 10 kèo gần nhất\n/report - gửi báo cáo ngay\n/networks - tên mạng chưa nhận diện\n/config - cấu hình hiện tại\n"
+        return ("<b>Commands</b>\n/status - bot & exchange status\n/check SYMBOL - why a token has / has no signal\n/deposit SYMBOL - deposit/withdraw status per chain & exchange\n"
+                "/top - last 10 signals\n/report - send daily report now\n/networks - unrecognized network names\n/config - current settings\n"
                 "/pause CHAIN · /resume CHAIN\n/blacklist SYMBOL · /unblacklist SYMBOL")
     if cmd == "/status":
         L = [f"<b>STATUS {VERSION}</b> {datetime.now(VN_TZ).strftime('%H:%M %d/%m')}"] + cex_health_lines() + [""]
         for k, st in STATS.items():
             s = st.snapshot(daily=True); ago = int(time.time() - st.last_scan) if st.last_scan else -1
-            L.append(f"{CHAINS[k]['emoji']} {k}{' (PAUSED)' if k in PAUSED else ''}: token {len(MULTI.by_chain.get(k, []))} · pool {s.get('pools',0)} · ứng viên {s.get('candidates',0)} · kèo {s.get('signals',0)} · vòng cuối {ago}s trước")
+            L.append(f"{CHAINS[k]['emoji']} {k}{' (PAUSED)' if k in PAUSED else ''}: tokens {len(MULTI.by_chain.get(k, []))} · pools {s.get('pools',0)} · candidates {s.get('candidates',0)} · signals {s.get('signals',0)} · last scan {ago}s ago")
         L.append("\nAPI: " + esc(API.line())); return "\n".join(L)
-    if cmd == "/check": return cmd_check(arg) if arg else "Dùng: /check SYMBOL"
-    if cmd == "/report": daily_report(); return "Đã gửi báo cáo."
+    if cmd == "/check": return cmd_check(arg) if arg else "Usage: /check SYMBOL"
+    if cmd == "/report": daily_report(); return "Report sent."
     if cmd == "/networks":
         with UNKNOWN_LOCK: top = UNKNOWN_NETS.most_common(40)
-        return "<b>Tên mạng chưa nhận diện</b> (thêm qua EXTRA_ALIASES nếu là mạng cần quét):\n" + ", ".join(f"{esc(n)}({c})" for n, c in top)
+        return "<b>Unrecognized network names</b> (add via EXTRA_ALIASES if needed):\n" + ", ".join(f"{esc(n)}({c})" for n, c in top)
     if cmd == "/config":
-        return (f"Lãi ròng ≥ {MIN_NET_PCT}% và ≥ {fmt_usd(MIN_NET_USD)} · size {fmt_usd(ORDER_SIZE_MIN)}–{fmt_usd(ORDER_SIZE_MAX)} (≤ {SIZE_LIQ_MAX_FRAC*100:.0f}% liq)\n"
-                f"Pool: liq ≥ {fmt_usd(MIN_LIQ_USD)}, vol ≥ {fmt_usd(MIN_VOL_24H)}, tx1h ≥ {MIN_TXNS_H1}, tuổi ≥ {MIN_POOL_AGE_H:.0f}h\n"
-                f"Chọn size: {'% lãi cao nhất' if SIZE_MODE == 'pct' else '$ lãi cao nhất'} · quote: {'Kyber + ParaSwap (lấy tốt nhất)' if MULTI_AGG else 'Kyber'}\n"
-                f"Impact ≤ {MAX_IMPACT_PCT}% · trượt CEX ≤ {MAX_CEX_SLIP_PCT}% · tax ≤ {TAX_MAX*100:.0f}% · mạng chưa có nguồn tax: mặc định {NO_SOURCE_TAX*100:.0f}% · tra cứu tax lỗi: {UNKNOWN_TAX_MODE} ({UNKNOWN_TAX_ASSUME*100:.0f}%)\n"
-                f"Contract suy ra: {'bật' if ALLOW_INFERRED_CONTRACT else 'tắt'} · trạng thái chưa xác minh: {'cho phép' if ALLOW_UNVERIFIED_STATUS else 'bỏ qua'}\n"
-                f"Mạng: {', '.join(CHAINS)}\nSàn: {', '.join(EXCHANGES)}")
+        return (f"Net profit ≥ {MIN_NET_PCT}% and ≥ {fmt_usd(MIN_NET_USD)} · size {fmt_usd(ORDER_SIZE_MIN)}–{fmt_usd(ORDER_SIZE_MAX)} (≤ {SIZE_LIQ_MAX_FRAC*100:.0f}% liq)\n"
+                f"Pool: liq ≥ {fmt_usd(MIN_LIQ_USD)}, vol ≥ {fmt_usd(MIN_VOL_24H)}, tx1h ≥ {MIN_TXNS_H1}, age ≥ {MIN_POOL_AGE_H:.0f}h\n"
+                f"Size mode: {'highest %' if SIZE_MODE == 'pct' else 'highest $'} · quote: {'Kyber + ParaSwap (best of)' if MULTI_AGG else 'Kyber'}\n"
+                f"Impact ≤ {MAX_IMPACT_PCT}% · CEX slippage ≤ {MAX_CEX_SLIP_PCT}% · tax ≤ {TAX_MAX*100:.0f}% · chains without tax source: default {NO_SOURCE_TAX*100:.0f}% · tax lookup failed: {UNKNOWN_TAX_MODE} ({UNKNOWN_TAX_ASSUME*100:.0f}%)\n"
+                f"Inferred contracts: {'on' if ALLOW_INFERRED_CONTRACT else 'off'} · unverified status: {'allowed' if ALLOW_UNVERIFIED_STATUS else 'skipped'}\n"
+                f"Chains: {', '.join(CHAINS)}\nExchanges: {', '.join(EXCHANGES)}")
     if cmd == "/top":
         rows = DB.q("SELECT id,symbol,chain,cex,direction,net_pct,usd,pnl_a,st_a FROM signals ORDER BY id DESC LIMIT 10")
-        if not rows: return "Chưa có kèo."
-        return "<b>10 kèo gần nhất</b>\n" + "\n".join(f"#{i} {esc(s)} [{ch}] {'DEX→' + cx if d == 'DEX_TO_CEX' else cx + '→DEX'} {n:+.2f}% {fmt_usd(u)} → {f'{pa:+.2f}%' if pa is not None else (sa or '...')}" for i, s, ch, cx, d, n, u, pa, sa in rows)
+        if not rows: return "No signals yet."
+        return "<b>Last 10 signals</b>\n" + "\n".join(f"#{i} {esc(s)} [{ch}] {'DEX→' + cx if d == 'DEX_TO_CEX' else cx + '→DEX'} {n:+.2f}% {fmt_usd(u)} → {f'{pa:+.2f}%' if pa is not None else (sa or '...')}" for i, s, ch, cx, d, n, u, pa, sa in rows)
     if cmd == "/deposit":
-        if not arg: return "Dùng: /deposit SYMBOL"
-        L = [f"<b>NẠP/RÚT {esc(arg)}</b> (❓ = sàn không công bố)"]
+        if not arg: return "Usage: /deposit SYMBOL"
+        L = [f"<b>DEPOSIT/WITHDRAW {esc(arg)}</b> (❓ = not published by exchange)"]
         for n, toks in MULTI.tokens.items():
             for t in toks:
                 if norm_sym(t["symbol"]) == norm_sym(arg):
                     fee = "?" if t["withdraw_fee"] is None else fmt_tok(t["withdraw_fee"])
-                    L.append(f"{n} · {CHAINS[t['chain']]['name']} ({esc(t['raw_network'])}): Nạp {status_icon(t['deposit_enable'])} Rút {status_icon(t['withdraw_enable'])} · phí rút {fee}" + ("" if t["contract"] else " · không có contract"))
-        return "\n".join(L) if len(L) > 1 else f"Không thấy {esc(arg)} trên các mạng đang quét."
+                    L.append(f"{n} · {CHAINS[t['chain']]['name']} ({esc(t['raw_network'])}): Deposit {status_icon(t['deposit_enable'])} Withdraw {status_icon(t['withdraw_enable'])} · withdraw fee {fee}" + ("" if t["contract"] else " · no contract"))
+        return "\n".join(L) if len(L) > 1 else f"{esc(arg)} not found on scanned chains."
     if cmd == "/pause":
-        if arg in CHAINS: PAUSED.add(arg); return f"Đã tạm dừng {arg}"
-        return "Mạng hợp lệ: " + ", ".join(CHAINS)
-    if cmd == "/resume": PAUSED.discard(arg); return f"Đã chạy lại {arg}"
+        if arg in CHAINS: PAUSED.add(arg); return f"Paused {arg}"
+        return "Valid chains: " + ", ".join(CHAINS)
+    if cmd == "/resume": PAUSED.discard(arg); return f"Resumed {arg}"
     if cmd == "/blacklist" and arg:
         k = f"SYM:{norm_sym(arg)}"; until = time.time() + 7 * 86400
         with BL_LOCK: BL[k] = until
-        DB.q("INSERT OR REPLACE INTO blacklist VALUES(?,?,?)", (k, until, "manual"), commit=True); return f"Đã blacklist {esc(arg)} 7 ngày"
+        DB.q("INSERT OR REPLACE INTO blacklist VALUES(?,?,?)", (k, until, "manual"), commit=True); return f"Blacklisted {esc(arg)} for 7 days"
     if cmd == "/unblacklist" and arg:
         k = f"SYM:{norm_sym(arg)}"
         with BL_LOCK: BL.pop(k, None)
-        DB.q("DELETE FROM blacklist WHERE key=?", (k,), commit=True); return f"Đã gỡ blacklist {esc(arg)}"
-    return "Lệnh không hợp lệ. /help"
+        DB.q("DELETE FROM blacklist WHERE key=?", (k,), commit=True); return f"Removed {esc(arg)} from blacklist"
+    return "Unknown command. /help"
 def telegram_poll_loop():
     offset = None
     while True:
@@ -1910,21 +1943,21 @@ def startup_report():
     MULTI.first_done.wait(timeout=240)
     warn = []
     for ch, cfg in CHAINS.items():
-        if cfg["kind"] == "evm" and not cfg.get("rpc") and not cfg.get("blockscout"): warn.append(f"{ch}: thiếu RPC_{ch} → không đọc được decimals")
-        if cfg["kind"] == "evm" and cfg.get("chain_id") not in GOPLUS_CHAINS | HONEYPOT_CHAINS: warn.append(f"{ch}: chưa có nguồn kiểm tra tax → tax mặc định {NO_SOURCE_TAX*100:.0f}%")
+        if cfg["kind"] == "evm" and not cfg.get("rpc") and not cfg.get("blockscout"): warn.append(f"{ch}: missing RPC_{ch} → cannot read token decimals")
+        if cfg["kind"] == "evm" and cfg.get("chain_id") not in GOPLUS_CHAINS | HONEYPOT_CHAINS: warn.append(f"{ch}: no tax data source → default tax {NO_SOURCE_TAX*100:.0f}%")
     for n, h in MULTI.health.items():
-        if h.get("err") and ("403" in h["err"] or "451" in h["err"]): warn.append(f"{n} chặn IP server → đổi region server (Singapore/Frankfurt/Tokyo)")
-    L = [f"🚀 <b>BOT {VERSION} đã khởi động</b>",
-         f"Mạng: {', '.join(CHAINS)}",
-         f"Báo khi lãi ròng ≥ {MIN_NET_PCT}% & ≥ {fmt_usd(MIN_NET_USD)} · size động {fmt_usd(ORDER_SIZE_MIN)}–{fmt_usd(ORDER_SIZE_MAX)}",
-         f"Báo cáo ngày: {DAILY_REPORT_HOUR}:00 (UTC+7)", "", "<b>Sàn:</b>"] + cex_health_lines()
+        if h.get("err") and ("403" in h["err"] or "451" in h["err"]): warn.append(f"{n} blocks the server IP → change server region (Singapore/Frankfurt/Tokyo)")
+    L = [f"🚀 <b>BOT {VERSION} started</b>",
+         f"Chains: {', '.join(CHAINS)}",
+         f"Alert when net profit ≥ {MIN_NET_PCT}% & ≥ {fmt_usd(MIN_NET_USD)} · dynamic size {fmt_usd(ORDER_SIZE_MIN)}–{fmt_usd(ORDER_SIZE_MAX)}",
+         f"Daily report: {DAILY_REPORT_HOUR}:00 (UTC+7)", "", "<b>Exchanges:</b>"] + cex_health_lines()
     tot = {k: len(v) for k, v in MULTI.by_chain.items()}
-    L.append("\nToken theo mạng: " + ", ".join(f"{k}={v}" for k, v in tot.items()))
-    if ALLOW_UNVERIFIED_STATUS: warn.append("ALLOW_UNVERIFIED_STATUS=1 → có thể báo kèo khi sàn chưa xác minh nạp/rút. Nên đặt 0")
-    if OBSOLETE_ENV: warn.append("Biến env cũ không còn dùng, nên xoá: " + ", ".join(OBSOLETE_ENV))
-    if not env_str("RENDER_EXTERNAL_URL") and not env_str("KEEPALIVE_URL"): warn.append("Không thấy RENDER_EXTERNAL_URL → keepalive tắt, gói Free có thể ngủ")
-    if warn: L += ["", "<b>Lưu ý:</b>"] + [f"⚠ {esc(w)}" for w in warn]
-    L.append("\nGõ /help để xem lệnh, /check SYMBOL để kiểm tra 1 token.")
+    L.append("\nTokens per chain: " + ", ".join(f"{k}={v}" for k, v in tot.items()))
+    if ALLOW_UNVERIFIED_STATUS: warn.append("ALLOW_UNVERIFIED_STATUS=1 → may alert when deposit/withdraw is unverified. Recommend 0")
+    if OBSOLETE_ENV: warn.append("Obsolete env vars, please remove: " + ", ".join(OBSOLETE_ENV))
+    if not env_str("RENDER_EXTERNAL_URL") and not env_str("KEEPALIVE_URL"): warn.append("RENDER_EXTERNAL_URL not found → keepalive off, Free plan may sleep")
+    if warn: L += ["", "<b>Notes:</b>"] + [f"⚠ {esc(w)}" for w in warn]
+    L.append("\nType /help for commands, /check SYMBOL to inspect a token.")
     send_long("\n".join(L))
 
 def main():
